@@ -17,7 +17,7 @@ with open("max.csv", "w", encoding='utf-8', newline='') as file:
         if ticker != current_ticker:
             current_ticker = ticker
             window = []
-        if window:
+        if len(window) >= 252:
             if high > max(window):
                 writer.writerow([ticker, fecha, high])
         window.append(high)
