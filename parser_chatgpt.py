@@ -24,34 +24,26 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import sys
 import time
-from pathlib import Path
 
 import duckdb
-import requests
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
-    DownloadColumn,
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
-    TimeRemainingColumn,
-    TransferSpeedColumn,
+    TimeRemainingColumn
 )
 from rich.table import Table
 
 # ── Configuración ─────────────────────────────────────────────────────────────
-HF_PARQUET_URL = (
-    "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data"
-    "/resolve/main/data/stock_prices.parquet"
-)
+
 LOCAL_PARQUET = "stock_prices.parquet"   # caché local
 OUTPUT_CSV    = "historico_completo.csv"
 
@@ -63,91 +55,11 @@ CHUNK_SIZE = 8 * 1024 * 1024   # 8 MB por chunk de descarga
 
 console = Console()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. DESCARGA DEL PARQUET CON BARRA DE PROGRESO
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _fmt_bytes(n: int) -> str:
     if n < 1024:      return f"{n} B"
     if n < 1024**2:   return f"{n/1024:.1f} KB"
     if n < 1024**3:   return f"{n/1024**2:.1f} MB"
     return f"{n/1024**3:.2f} GB"
-
-
-def descargar_parquet(url: str, destino: str, forzar: bool = False) -> None:
-    """Descarga el archivo Parquet de Hugging Face con barra de progreso real."""
-
-    if os.path.exists(destino) and not forzar:
-        tam = os.path.getsize(destino)
-        console.print(
-            f"[green]✓[/] Parquet en caché local: [bold]{destino}[/] "
-            f"([dim]{_fmt_bytes(tam)}[/])\n"
-            "  [dim]Usa --forzar para re-descargar.[/]\n"
-        )
-        return
-
-    console.print("[bold cyan]→ Descargando Parquet desde Hugging Face...[/]")
-    console.print(f"  URL: [dim]{url}[/]\n")
-
-    try:
-        r = requests.get(url, stream=True, timeout=60,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-    except requests.RequestException as e:
-        console.print(f"[red]ERROR al conectar con Hugging Face: {e}[/]")
-        sys.exit(1)
-
-    total = int(r.headers.get("Content-Length", 0))
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=38),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TextColumn("•"),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TimeRemainingColumn(),
-        console=console,
-        expand=True,
-    )
-
-    tarea = progress.add_task(
-        "[cyan]stock_prices.parquet[/]",
-        total=total if total else None,
-    )
-
-    tmp = destino + ".tmp"
-    t_inicio = time.time()
-
-    try:
-        with progress, open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    f.write(chunk)
-                    progress.advance(tarea, len(chunk))
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Descarga interrumpida. Borrando archivo parcial.[/]")
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        sys.exit(0)
-    except Exception as e:
-        console.print(f"\n[red]Error durante la descarga: {e}[/]")
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        sys.exit(1)
-
-    os.replace(tmp, destino)
-    elapsed = time.time() - t_inicio
-    tam_final = os.path.getsize(destino)
-    vel = tam_final / elapsed if elapsed > 0 else 0
-    console.print(
-        f"\n[bold green]✓ Parquet descargado:[/] {_fmt_bytes(tam_final)} "
-        f"en {elapsed:.0f}s · velocidad media {_fmt_bytes(int(vel))}/s\n"
-    )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. CONVERSIÓN PARQUET → CSV CON BARRA DE PROGRESO
@@ -281,129 +193,5 @@ def convertir_a_csv(parquet: str, salida: str) -> None:
     console.print(f"  Tamaño:  [bold white]{_fmt_bytes(tam_final)}[/]")
     console.print(f"  Tiempo:  [bold white]{elapsed:.0f}s[/]")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. BONUS: CONSULTA DIRECTA DE MÁXIMOS DE 52 SEMANAS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def consultar_52_semanas(fecha: str, parquet: str = LOCAL_PARQUET) -> None:
-    """
-    Sin necesidad del CSV, usa DuckDB sobre el Parquet local para encontrar
-    todos los tickers que hicieron máximo de 52 semanas en 'fecha'.
-    Esto es lo que haría el backend de tu proyecto, pero ejecutado en local.
-
-    Ejemplo:  python descargar_historico.py --consultar 2024-03-15
-    """
-    if not os.path.exists(parquet):
-        console.print(f"[red]ERROR:[/] No existe {parquet}. Ejecuta sin --consultar primero.")
-        sys.exit(1)
-
-    console.print(f"\n[bold cyan]→ Máximos de 52 semanas · {fecha}[/]")
-    t0 = time.time()
-    con = duckdb.connect()
-
-    resultado = con.execute(f"""
-        WITH dia AS (
-            SELECT symbol, report_date, open, high, low, close, volume
-            FROM read_parquet('{parquet}')
-            WHERE report_date = '{fecha}'
-        ),
-        ventana AS (
-            SELECT symbol, MAX(high) AS max_52w
-            FROM read_parquet('{parquet}')
-            WHERE report_date >= (DATE '{fecha}' - INTERVAL 52 WEEK)
-              AND report_date <  DATE '{fecha}'
-            GROUP BY symbol
-        )
-        SELECT
-            dia.symbol                   AS TICKER,
-            ROUND(dia.open,  4)          AS OPEN,
-            ROUND(dia.high,  4)          AS HIGH,
-            ROUND(dia.low,   4)          AS LOW,
-            ROUND(dia.close, 4)          AS CLOSE,
-            CAST(dia.volume AS BIGINT)   AS VOLUME
-        FROM dia
-        JOIN ventana ON dia.symbol = ventana.symbol
-        WHERE dia.high > ventana.max_52w
-        ORDER BY dia.high DESC
-    """).df()
-    con.close()
-
-    elapsed = time.time() - t0
-    if resultado.empty:
-        console.print(f"  [yellow]Sin resultados para {fecha}.[/]")
-        return
-
-    console.print(
-        f"  [bold green]{len(resultado)}[/] tickers hicieron máximo de 52 semanas "
-        f"· calculado en [bold]{elapsed:.2f}s[/]\n"
-    )
-    console.print(resultado.to_string(index=False))
-
-    # Guardar resultado en CSV
-    out = f"52w_high_{fecha}.csv"
-    resultado.to_csv(out, index=False)
-    console.print(f"\n  [dim]Guardado en {out}[/]")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. PUNTO DE ENTRADA
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Descarga histórico NYSE+NASDAQ via defeatbeta-api (Parquet → CSV)"
-    )
-    parser.add_argument(
-        "--forzar",   action="store_true",
-        help="Re-descarga el Parquet aunque ya exista en disco"
-    )
-    parser.add_argument(
-        "--solo-csv", action="store_true",
-        help="Salta la descarga del Parquet; convierte el caché local directamente"
-    )
-    parser.add_argument(
-        "--sin-csv",  action="store_true",
-        help="Solo descarga el Parquet, no genera el CSV"
-    )
-    parser.add_argument(
-        "--consultar", metavar="YYYY-MM-DD",
-        help="Bonus: calcula los tickers con máximo de 52 semanas en esa fecha"
-    )
-    args = parser.parse_args()
-
-    console.rule("[bold cyan]Histórico NYSE + NASDAQ — defeatbeta-api[/]")
-    console.print(f"  Parquet caché:  [bold]{LOCAL_PARQUET}[/]")
-    console.print(f"  CSV de salida:  [bold]{OUTPUT_CSV}[/]")
-    console.print(f"  Rango fechas:   [bold]{START_DATE}[/] → [bold]{END_DATE or 'último disponible'}[/]\n")
-
-    # Modo consulta directa 52w (no necesita el CSV)
-    if args.consultar:
-        consultar_52_semanas(args.consultar)
-        return
-
-    # Paso 1: descarga del Parquet
-    if not args.solo_csv:
-        descargar_parquet(HF_PARQUET_URL, LOCAL_PARQUET, forzar=args.forzar)
-
-    if args.sin_csv:
-        console.print("[green]Parquet listo. CSV omitido (--sin-csv activo).[/]")
-        return
-
-    # Paso 2: verificar Parquet
-    if not os.path.exists(LOCAL_PARQUET):
-        console.print(f"[red]ERROR:[/] No se encontró {LOCAL_PARQUET}.")
-        sys.exit(1)
-
-    # Paso 3: convertir a CSV
-    convertir_a_csv(LOCAL_PARQUET, OUTPUT_CSV)
-
-    console.rule()
-    console.print(
-        "\n[dim]Tip: puedes consultar máximos de 52w directamente sobre el Parquet:[/]"
-        "\n  [bold]python descargar_historico.py --consultar 2024-03-15[/]\n"
-    )
-
-
 if __name__ == "__main__":
-    main()
+    convertir_a_csv(LOCAL_PARQUET, OUTPUT_CSV)

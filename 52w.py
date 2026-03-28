@@ -10,10 +10,10 @@ window = []
 with open("max.csv", "w", encoding='utf-8', newline='') as file:
     writer = csv.writer(file)
     writer.writerow(["TICKER", "FECHA", "HIGH"])
-    for fila in valores_historicos.itertuples():
-        ticker = fila.TICKER
-        fecha = fila.DATE
-        high = fila.HIGH
+    for row in valores_historicos.itertuples():
+        ticker = row.TICKER
+        fecha = row.DATE
+        high = row.HIGH
         if ticker != current_ticker:
             current_ticker = ticker
             window = []
