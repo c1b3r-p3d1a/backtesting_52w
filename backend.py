@@ -120,7 +120,7 @@ async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día de
             }
         }
     })
-async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", openapi_examples={
+async def sp500_by_date(day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", openapi_examples={
                 "normal": {
                     "description": "Ejemplo válido",
                     "value": 3
