@@ -1,11 +1,12 @@
 import pandas as pd
 import requests
 import os
-from price_parquet_to_csv import ParquetToCSV
+from tools.price_parquet_to_csv import ParquetToCSV
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
+import math
 
 load_dotenv()
 app = FastAPI(docs_url=False, title="52W Backtester API", version="1.0.0", description="Consulta de máximos de 52 semanas sobre el mercado americano.")
@@ -14,16 +15,17 @@ security = HTTPBearer()
 API_KEY = os.getenv("API_KEY")
 CSV_PATH = ".\\db\\max.csv"
 STOCK_PATH = ".\\db\\stock_profile.csv"
+SP500_PATH = ".\\db\\sp500.csv"
 STOCK_PROFILE_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_profile.parquet"
 STOCK_PRICES_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_prices.parquet"
 
-print("[+] Leyendo fichero CSV")
+print("[+] Leyendo ficheros CSV")
 PRICE_DATA = pd.read_csv(CSV_PATH, sep=",", encoding="utf-8")
-print("[+] Fichero leído correctamente")
+SP500 = pd.read_csv(SP500_PATH, sep=",", encoding="utf-8")
+print("[+] Ficheros leído correctamente")
 print("\n[+] Leyendo información de empresas")
 COMP_DATA = pd.read_csv(STOCK_PATH, sep=",", encoding="utf-8")
 print("[+] Fichero leído correctamente\n\n")
-
 if not API_KEY:
     raise RuntimeError("[-] API_KEY no encontrada en el fichero .env")
 
@@ -32,12 +34,17 @@ def verificar_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
         raise HTTPException(status_code=401, detail="Token inválido o no autorizado")
     return credentials.credentials
 
+def limpiar_valores(x):
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+        return None
+    return x
+
 @app.get("/date", tags=["Máximos 52W"], summary="Máximo 52W Fecha", description="De una fecha, obtiene todas las empresas (tickers) en las que tuvieron su mayor HIGH en esa sesión respecto a sus 252 sesiones anteriores.", responses={
         200: {
             "description": "Petición exitosa",
             "content": {
                 "application/json": {
-                    "example": [["BSRR","2003-03-03",14],["BXMT","2003-03-03",174.3],["CHN","2003-03-03",16.55],["CRMZ","2003-03-03",0.31],["DSS","2003-03-03",3565.46],["EBAY","2003-03-03",8.36],["FCCO","2003-03-03",17.09],["FNMAG","2003-03-03",53],["GGLXF","2003-03-03",7.25],["GRMN","2003-03-03",17.09],["HOFT","2003-03-03",11.1],["HOPE","2003-03-03",6.41],["IRM","2003-03-03",14.68],["IRS","2003-03-03",8.6],["JHS","2003-03-03",15.5],["LXU","2003-03-03",2.92],["MEOH","2003-03-03",9.55],["NEU","2003-03-03",9.99],["NRK","2003-03-03",15],["NRP","2003-03-03",116],["PWOD","2003-03-03",22.15],["TEI","2003-03-03",12.48],["TPR","2003-03-03",9.13],["TTC","2003-03-03",4.38],["VEON","2003-03-03",64.65],["VTRS","2003-03-03",19.17],["WEYS","2003-03-03",14.67]]
+                    "example": [["BSRR","2003-03-03",13.86,13.88,14,13.85,7900,128328928],["BXMT","2003-03-03",172.8,174.3,174.3,171,450,94575180],["CHN","2003-03-03",16.4,16.42,16.55,16.35,148400,"null"],["CRMZ","2003-03-03",0.31,0.31,0.31,0.31,6500,"null"],["DSS","2003-03-03",3231.2,3454.04,3565.46,3119.78,1,13125352],["EBAY","2003-03-03",8.26,8.16,8.36,8.15,46267373,10267107024],["FCCO","2003-03-03",17.09,17.09,17.09,17.09,500,27138920],["GGLXF","2003-03-03",7.25,7.25,7.25,6.5,360,16785200],["GRMN","2003-03-03",17.08,16.8,17.09,16.7,657000,3626103600],["HOPE","2003-03-03",6.12,6.29,6.41,6.12,67200,134590275],["IRM","2003-03-03",14.58,14.3,14.68,14.3,1146650,2738056750],["IRS","2003-03-03",8.6,8.43,8.6,8.43,106845,173233971],["JHS","2003-03-03",15.48,15.5,15.5,15.34,16300,"null"],["LXU","2003-03-03",2.88,2.92,2.92,2.88,4680,45440748],["MEOH","2003-03-03",9.3,9.08,9.55,9.08,329100,1140916528],["NEU","2003-03-03",8.96,9.9,9.99,8.96,85800,165221100],["PWOD","2003-03-03",22.15,21.31,22.15,21.31,3762,"null"],["TEI","2003-03-03",12.23,12.35,12.48,12.21,226100,"null"],["TPR","2003-03-03",9,8.86,9.13,8.79,5049200,3192856936],["TTC","2003-03-03",4.32,4.31,4.38,4.28,891200,843710946],["VEON","2003-03-03",63.17,64.07,64.65,63,261780,"null"],["VTRS","2003-03-03",18.93,18.79,19.17,18.67,2374350,"null"],["WEYS","2003-03-03",13.66,14.67,14.67,13.66,13800,166868316]]
                 }
             },
         },
@@ -83,7 +90,62 @@ async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día de
 
     for row in PRICE_DATA.itertuples():
         if row.FECHA == str(year)+"-"+str(month)+"-"+str(day):
-            matches.append([row.TICKER, row.FECHA, row.HIGH])
+            matches.append([row.TICKER, row.FECHA, limpiar_valores(row.OPEN), limpiar_valores(row.CLOSE), limpiar_valores(row.HIGH), limpiar_valores(row.LOW), limpiar_valores(row.VOLUME), limpiar_valores(row.MARKET_CAP)])
+
+    return matches
+
+@app.get("/sp500", tags=["S&P500"], summary="S&P500", description="Obtiene información sobre el S&P500 en una fecha concreta", responses={
+        200: {
+            "description": "Petición exitosa",
+            "content": {
+                "application/json": {
+                    "example": [["2003-03-03",841.1500244140625,834.8099975585938,852.3400268554688,832.739990234375,1208900000]]
+                }
+            },
+        },
+        401: {
+            "description": "Token inválido o no autorizado",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Token inválido o no autorizado"}
+                }
+            }
+        },
+        422: {
+            "description": "Error de validación en los parámetros",
+            "content": {
+                "application/json": {
+                    "example": {"detail": [{"loc": ["query", "day"], "msg": "Input should be less than or equal to 31", "type": "less_than_equal"}]}
+                }
+            }
+        }
+    })
+async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 3
+                }}),
+    month: int = Query(..., ge=1, le=12, description="Mes del año (1-12)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 3
+                }}),
+    year: int = Query(..., ge=2000, description="Año en formato YYYY", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 2003
+                }}),
+    token: str = Depends(verificar_api_key)):
+    matches = []
+    
+    if len(str(day)) < 2:
+        day = str(day).zfill(2)
+    if len(str(month)) < 2:
+        month = str(month).zfill(2)
+
+    for row in SP500.itertuples():
+        if row.DATE == str(year)+"-"+str(month)+"-"+str(day):
+            matches.append([row.DATE, limpiar_valores(row.OPEN), limpiar_valores(row.ADJ_CLOSE), limpiar_valores(row.HIGH), limpiar_valores(row.LOW), limpiar_valores(row.VOLUME)])
 
     return matches
 
@@ -92,7 +154,7 @@ async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día de
             "description": "Petición exitosa",
             "content": {
                 "application/json": {
-                    "example": [["IBEX","2020-11-18",19.44],["IBEX","2020-11-19",19.5],["IBEX","2020-11-25",20.25],["IBEX","2020-11-30",20.37],["IBEX","2020-12-01",20.41],["IBEX","2020-12-03",20.5],["IBEX","2020-12-04",22],["IBEX","2020-12-08",22.45],["IBEX","2020-12-09",22.79],["IBEX","2021-02-19",23.57],["IBEX","2021-02-24",24.25],["IBEX","2021-04-05",24.68],["IBEX","2021-04-16",25],["IBEX","2021-04-23",25.5],["IBEX","2022-11-10",22.5],["IBEX","2022-11-11",23.36],["IBEX","2022-11-15",23.45],["IBEX","2022-11-16",24.98],["IBEX","2022-11-18",25.2],["IBEX","2022-11-21",26.93],["IBEX","2022-12-02",26.97],["IBEX","2022-12-06",27],["IBEX","2022-12-07",27.63],["IBEX","2022-12-13",27.77],["IBEX","2023-01-18",28.33],["IBEX","2023-01-19",28.47],["IBEX","2023-02-16",31.4],["IBEX","2024-09-13",20.02],["IBEX","2024-09-16",20.56],["IBEX","2024-11-20",20.95],["IBEX","2024-11-21",21.63],["IBEX","2024-12-30",21.96],["IBEX","2025-01-03",22.43],["IBEX","2025-01-16",22.45],["IBEX","2025-01-17",22.48],["IBEX","2025-01-21",22.52],["IBEX","2025-01-29",22.53],["IBEX","2025-01-30",22.67],["IBEX","2025-02-07",25.03],["IBEX","2025-02-11",26.22],["IBEX","2025-02-12",26.53],["IBEX","2025-02-13",27.34],["IBEX","2025-02-14",27.83],["IBEX","2025-05-09",32.08],["IBEX","2025-09-12",42.99]]
+                    "example": [["IBEX","2022-11-10",20.17,22.5,22.5,19.89,154800,410580000],["IBEX","2022-11-11",22.5,22.39,23.36,21.79,101800,408572720],["IBEX","2022-11-15",22.22,22.52,23.45,22.13,53900,410944960],["IBEX","2022-11-16",24,24.44,24.98,23.55,184800,445981120],["IBEX","2022-11-18",24.15,24.85,25.2,23.72,120300,453462800],["IBEX","2022-11-21",25.1,26.05,26.93,24.8,134800,475360400],["IBEX","2022-12-02",25.57,26.33,26.97,25.24,111200,480469840],["IBEX","2022-12-06",26.72,26.68,27,26.12,97100,486856640],["IBEX","2022-12-07",26.6,27.17,27.63,25.36,102100,495798160],["IBEX","2022-12-13",26.95,26.91,27.77,26.7,54600,491053680],["IBEX","2023-01-18",27.3,27.87,28.33,27.26,156500,508571760],["IBEX","2023-01-19",27.87,27.79,28.47,27.58,145700,507111920],["IBEX","2023-02-16",28.25,29.64,31.4,27.77,218600,540870720],["IBEX","2024-09-13",18,19.55,20.02,17.97,537200,328502560],["IBEX","2024-09-16",19.57,19.94,20.56,19.57,403000,335055808],["IBEX","2024-11-20",20.45,20.02,20.95,19.92,294200,264314050],["IBEX","2024-11-21",20,21.13,21.63,19.83,453900,278968825],["IBEX","2024-12-30",21.25,21.45,21.96,20.64,235900,283193625],["IBEX","2025-01-03",21.85,21.78,22.43,21.55,190600,287093070],["IBEX","2025-01-16",22.16,22.28,22.45,22.06,79400,293683820],["IBEX","2025-01-17",22.44,22.13,22.48,22.1,102400,291706595],["IBEX","2025-01-21",22.22,22.21,22.52,22,82000,292761115],["IBEX","2025-01-29",22.39,22.32,22.53,21.98,117500,294211080],["IBEX","2025-01-30",22.37,22.09,22.67,22.08,105600,291179335],["IBEX","2025-02-07",22.5,24.49,25.03,22.31,508100,323069631],["IBEX","2025-02-11",24.8,25.95,26.22,24.73,478700,342329805],["IBEX","2025-02-12",25.08,26.48,26.53,25.08,504100,349321512],["IBEX","2025-02-13",26.3,27.24,27.34,26.28,371400,359347356],["IBEX","2025-02-14",27.52,27.3,27.83,26.7,332000,360138870],["IBEX","2025-05-09",28.02,30.55,32.08,27.66,759000,408526820],["IBEX","2025-09-12",38.94,41.58,42.99,38.22,1473500,553641858]]
                 }
             },
         },
@@ -127,7 +189,7 @@ async def scrape_by_ticker(ticker: str = Query(..., min_length=1, max_length=10,
 
     for row in PRICE_DATA.itertuples():
         if row.TICKER == ticker:
-            matches.append([row.TICKER, row.FECHA, row.HIGH])
+            matches.append([row.TICKER, row.FECHA, limpiar_valores(row.OPEN), limpiar_valores(row.CLOSE), limpiar_valores(row.HIGH), limpiar_valores(row.LOW), limpiar_valores(row.VOLUME), limpiar_valores(row.MARKET_CAP)])
 
     return matches
 
