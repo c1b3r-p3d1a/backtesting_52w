@@ -12,20 +12,20 @@ app = FastAPI(docs_url=False, title="52W Backtester API", version="1.0.0", descr
 security = HTTPBearer()
 
 API_KEY = os.getenv("API_KEY")
-CSV_PATH = ".\\max.csv"
-STOCK_PATH = ".\\stock_profile.csv"
+CSV_PATH = ".\\db\\max.csv"
+STOCK_PATH = ".\\db\\stock_profile.csv"
 STOCK_PROFILE_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_profile.parquet"
 STOCK_PRICES_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_prices.parquet"
-
-if not API_KEY:
-    raise RuntimeError("[-] API_KEY no encontrada en el fichero .env")
 
 print("[+] Leyendo fichero CSV")
 PRICE_DATA = pd.read_csv(CSV_PATH, sep=",", encoding="utf-8")
 print("[+] Fichero leído correctamente")
 print("\n[+] Leyendo información de empresas")
 COMP_DATA = pd.read_csv(STOCK_PATH, sep=",", encoding="utf-8")
-print("[+] Fichero leído correctamente")
+print("[+] Fichero leído correctamente\n\n")
+
+if not API_KEY:
+    raise RuntimeError("[-] API_KEY no encontrada en el fichero .env")
 
 def verificar_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if credentials.credentials != API_KEY:
@@ -58,9 +58,21 @@ def verificar_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
             }
         }
     })
-async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", example=3),
-    month: int = Query(..., ge=1, le=12, description="Mes del año (1-12)", example=3),
-    year: int = Query(..., ge=2000, description="Año en formato YYYY", example=2003),
+async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 3
+                }}),
+    month: int = Query(..., ge=1, le=12, description="Mes del año (1-12)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 3
+                }}),
+    year: int = Query(..., ge=2000, description="Año en formato YYYY", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 2003
+                }}),
     token: str = Depends(verificar_api_key)):
     matches = []
     
@@ -100,7 +112,14 @@ async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día de
             }
         }
     })
-async def scrape_by_ticker(ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", example="IBEX"),
+async def scrape_by_ticker(ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", openapi_examples={
+                "normal": {
+                    "summary": "Obtiene los días de la empresa en los cuales se cumple que su HIGH fue el máximo en las últimas 252 sesiones registradas",
+                    "description": "",
+                    "value": {
+                        "ticker": "IBEX"
+                    },
+                }}),
     token: str = Depends(verificar_api_key)):
     matches = []
 
@@ -121,17 +140,17 @@ def update_parquet_files_and_transform_to_csv():
     if not int(input("[?] ¿Desea continuar con la actualización? (Sí:1 No:0): ")):
         return
     
-    if os.path.isfile("stock_prices.parquet"):
-        os.rename("stock_prices.parquet", "stock_prices.parquet.bck1")
+    if os.path.isfile(".\\db\\stock_prices.parquet"):
+        os.rename(".\\db\\stock_prices.parquet", ".\\db\\stock_prices.parquet.bck1")
 
-    if os.path.isfile("stock_profile.parquet"):
-        os.rename("stock_profile.parquet", "stock_profile.parquet.bck1")
+    if os.path.isfile(".\\db\\stock_profile.parquet"):
+        os.rename(".\\db\\stock_profile.parquet", ".\\db\\stock_profile.parquet.bck1")
 
-    if os.path.isfile("historico_completo.csv"):
-        os.rename("historico_completo.csv", "historico_completo.csv.bck1")
+    if os.path.isfile(".\\db\\historico_completo.csv"):
+        os.rename(".\\db\\historico_completo.csv", ".\\db\\historico_completo.csv.bck1")
 
-    if os.path.isfile("stock_profile.csv"):
-        os.rename("stock_profile.csv", "stock_profile.csv.bck1")
+    if os.path.isfile(".\\db\\stock_profile.csv"):
+        os.rename(".\\db\\stock_profile.csv", ".\\db\\stock_profile.csv.bck1")
 
     with requests.get(STOCK_PRICES_URL, stream=True) as r:
         r.raise_for_status()
@@ -144,19 +163,19 @@ def update_parquet_files_and_transform_to_csv():
     with requests.get(STOCK_PROFILE_URL, stream=True) as r:
         r.raise_for_status()
 
-        with open("stock_profile.parquet", "wb") as file:
+        with open(".\\db\\stock_profile.parquet", "wb") as file:
             for chunk in r.iter_content(chunk_size=8192):
                 file.write(chunk)
             file.close()
 
     converter = ParquetToCSV(
-        local_parquet="stock_prices.parquet",
-        output_csv="historico_completo.csv",
+        local_parquet=".\\db\\stock_prices.parquet",
+        output_csv=".\\db\\historico_completo.csv",
         start_date="2000-01-01",
         end_date=None,
     )
     converter.convert()
-    parquet_to_csv("stock_profile.parquet", "stock_profile")
+    parquet_to_csv(".\\db\\stock_profile.parquet", ".\\db\\stock_profile")
 
 def parquet_to_csv(file_path: str, file_name: str):
     parquet = pd.read_parquet(file_path)
@@ -196,7 +215,14 @@ def parquet_to_csv(file_path: str, file_name: str):
         },
         }
     })
-async def get_ticker_info(ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", example="AAPL"),
+async def get_ticker_info(ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", openapi_examples={
+                "normal": {
+                    "summary": "Obtiene información sobre Apple",
+                    "description": "",
+                    "value": {
+                        "ticker": "AAPL"
+                    },
+                }}),
     token: str = Depends(verificar_api_key)):
     ticker = ticker.upper()
 
@@ -214,8 +240,8 @@ if __name__ == "__main__":
 | ___|___ \ \      / / __ )  __ _  ___| | _| |_ ___  ___| |_ ___ _ __ 
 |___ \ __) \ \ /\ / /|  _ \ / _` |/ __| |/ / __/ _ \/ __| __/ _ \ '__|
  ___) / __/ \ V  V / | |_) | (_| | (__|   <| ||  __/\__ \ ||  __/ |   
-|____/_____| \_/\_/  |____/ \__,_|\___|_|\_\\__\___||___/\__\___|_|  """)
-    try:
-        uvicorn.run("backend:app", host="127.0.0.1", port=3333, reload=True)        
+|____/_____| \_/\_/  |____/ \__,_|\___|_|\_\\__\___||___/\__\___|_|  \n\n""")
+    try:        
+        uvicorn.run("backend:app", host="127.0.0.1", port=3333, reload=True)
     except Exception as e:
         print(f"[-] Error desconocido: {e}")
