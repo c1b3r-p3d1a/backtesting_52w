@@ -185,11 +185,11 @@ Una señal se emite en la sesión `X` cuando:
 HIGH(X) > max( HIGH(X-1), HIGH(X-2), ..., HIGH(X-252) )
 ```
 
-Se requieren **al menos 252 sesiones previas** antes de que un ticker pueda emitir su primera señal. El precio de referencia para seguimiento posterior (Día 0) es el **CLOSE** de la sesión de señal.
+Se requieren **al menos 252 sesiones previas** antes de que un ticker pueda emitir su primera señal. El precio de referencia para seguimiento posterior es el **OPEN** de la siguiente sesión de la señal.
 
 ---
 
-## Actualizar el dataset
+## Actualizar el dataset (no incluye todos los datasets la func)
 
 Para descargar una versión nueva del parquet y regenerar las señales, ejecutar manualmente desde `backend.py`:
 
