@@ -1,15 +1,24 @@
 import pandas as pd
 import requests
 import os
-from tools.price_parquet_to_csv import ParquetToCSV
+from tools.price_parquet_to_csv_claude import ParquetToCSV
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import math
+import numpy as np
+import json
 
 load_dotenv()
 app = FastAPI(docs_url=False, title="52W Backtester API", version="1.0.0", description="Consulta de máximos de 52 semanas sobre el mercado americano.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # en producción poner el dominio
+    allow_methods=["GET"],
+    allow_headers=["Authorization"],
+)
 security = HTTPBearer()
 
 API_KEY = os.getenv("API_KEY")
@@ -124,7 +133,8 @@ async def scrape_by_date(day: int = Query(..., ge=1, le=31, description="Día de
             }
         }
     })
-async def sp500_by_date(day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", openapi_examples={
+async def sp500_by_date(
+    day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", openapi_examples={
                 "normal": {
                     "description": "Ejemplo válido",
                     "value": 3
@@ -149,7 +159,7 @@ async def sp500_by_date(day: int = Query(..., ge=1, le=31, description="Día del
 
     for row in SP500.itertuples():
         if row.DATE == str(year)+"-"+str(month)+"-"+str(day):
-            matches.append([row.DATE, limpiar_valores(row.OPEN), limpiar_valores(row.ADJ_CLOSE), limpiar_valores(row.HIGH), limpiar_valores(row.LOW), limpiar_valores(row.VOLUME)])
+            matches.append([row.Index, row.DATE, limpiar_valores(row.OPEN), limpiar_valores(row.ADJ_CLOSE), limpiar_valores(row.HIGH), limpiar_valores(row.LOW), limpiar_valores(row.VOLUME)])
 
     return matches
 
@@ -178,7 +188,8 @@ async def sp500_by_date(day: int = Query(..., ge=1, le=31, description="Día del
             }
         }
     })
-async def scrape_by_ticker(ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", openapi_examples={
+async def scrape_by_ticker(
+    ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", openapi_examples={
                 "normal": {
                     "summary": "Obtiene los días de la empresa en los cuales se cumple que su HIGH fue el máximo en las últimas 252 sesiones registradas",
                     "description": "",
@@ -281,7 +292,8 @@ def parquet_to_csv(file_path: str, file_name: str):
         },
         }
     })
-async def get_ticker_info(ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", openapi_examples={
+async def get_ticker_info(
+    ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", openapi_examples={
                 "normal": {
                     "summary": "Obtiene información sobre Apple",
                     "description": "",
@@ -293,9 +305,72 @@ async def get_ticker_info(ticker: str = Query(..., min_length=1, max_length=10, 
     ticker = ticker.upper()
 
     result = COMP_DATA[COMP_DATA["symbol"] == ticker]
+    
     if result.empty:
         raise HTTPException(status_code=404, detail="El ticker no se encuentra registrado en la base de datos")
-    return result.iloc[0].to_dict()
+    
+    row = result.iloc[0].replace([np.nan, np.inf, -np.inf], None)
+
+    return row.to_dict()
+
+@app.get("/rend", tags=["Rendimiento"], summary="Rendiento ticker", description="Obtiene el rendimienot de un ticker a lo largo del tiempo frente al S&P500")
+async def get_performance_ticker(
+    ticker: str = Query(..., min_length=1, max_length=10, description="Símbolo bursátil del activo", openapi_examples={
+                "normal": {
+                    "description": "Símbolo bursátil",
+                    "value": {
+                        "ticker": "AMZN"
+                    },
+                }}), 
+    day: int = Query(..., ge=1, le=31, description="Día del mes (1-31)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 17
+                }}),
+    month: int = Query(..., ge=1, le=12, description="Mes del año (1-12)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 3
+                }}),
+    year: int = Query(..., ge=2000, description="Año en formato YYYY", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 2003
+                }}),
+    token: str = Depends(verificar_api_key)):
+    
+    date = f"{year}-{month}-{day}"
+
+    if not ((PRICE_DATA["TICKER"] == ticker) & (pd.to_datetime(PRICE_DATA["FECHA"]) == pd.to_datetime(date))).any():
+        raise HTTPException(status_code=400, detail=f"El ticker no cumple la condición de 52W en el {day} del {month} del {year}")
+    
+    db = pd.read_parquet(f".\\db\\fragmented\\{str(ticker)[0].lower()}.parquet")
+
+    mask = (db['TICKER'] == ticker) & (pd.to_datetime(db['FECHA']) == pd.to_datetime(date))
+    index = db.index[mask]
+    
+    offsets = list(range(8, 253, 7))
+    resultados = []
+
+    if not index.empty:
+        index = index[0]
+        pos = db.index.get_loc(index)
+        sp500_index = await sp500_by_date(day, month, year)
+        sp500_index = sp500_index[0][0]
+        precio_inicial = db.iloc[pos+1]["OPEN"]
+        sp500_inicial = SP500.iloc[sp500_index+1]["ADJ_CLOSE"]
+        for offset in offsets:
+            if (pos+offset < len(db)) and (sp500_index+offset < len(SP500)):
+                precio_final = db.iloc[pos+offset]["CLOSE"]
+                rend_ticker = ((precio_final-precio_inicial)/precio_inicial)*100
+                sp500_final = SP500.iloc[sp500_index+offset]["ADJ_CLOSE"]
+                rend_sp500 = ((sp500_final-sp500_inicial)/sp500_inicial)*100
+                alpha = float(rend_ticker) - rend_sp500
+                resultados.append([offset-1, rend_ticker, rend_sp500, alpha])
+    
+    return resultados
+
+    
 
 if __name__ == "__main__":
     clean_screen()
