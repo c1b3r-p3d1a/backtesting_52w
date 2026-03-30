@@ -26,6 +26,7 @@ print("[+] Ficheros leído correctamente")
 print("\n[+] Leyendo información de empresas")
 COMP_DATA = pd.read_csv(STOCK_PATH, sep=",", encoding="utf-8")
 print("[+] Fichero leído correctamente\n\n")
+
 if not API_KEY:
     raise RuntimeError("[-] API_KEY no encontrada en el fichero .env")
 
@@ -38,6 +39,9 @@ def limpiar_valores(x):
     if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
         return None
     return x
+
+def clean_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
 
 @app.get("/date", tags=["Máximos 52W"], summary="Máximo 52W Fecha", description="De una fecha, obtiene todas las empresas (tickers) en las que tuvieron su mayor HIGH en esa sesión respecto a sus 252 sesiones anteriores.", responses={
         200: {
@@ -292,9 +296,6 @@ async def get_ticker_info(ticker: str = Query(..., min_length=1, max_length=10, 
     if result.empty:
         raise HTTPException(status_code=404, detail="El ticker no se encuentra registrado en la base de datos")
     return result.iloc[0].to_dict()
-
-def clean_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
 
 if __name__ == "__main__":
     clean_screen()
