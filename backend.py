@@ -12,9 +12,14 @@ import numpy as np
 
 load_dotenv()
 app = FastAPI(docs_url=False, title="52W Backtester API", version="1.0.0", description="Consulta de máximos de 52 semanas sobre el mercado americano.")
+origins = [
+    "http://127.0.0.1:3333",
+    "http://localhost:3000",
+    "https://52w-signal-insights.vercel.app"
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # en producción poner el dominio
+    allow_origins=origins,
     allow_methods=["GET"],
     allow_headers=["Authorization"],
 )
