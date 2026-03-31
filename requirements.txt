@@ -5,3 +5,4 @@ fastapi==0.135.2
 uvicorn==0.40.0
 python-dotenv==1.2.2
 duckdb==1.4.3
+pyarrow==23.0.
