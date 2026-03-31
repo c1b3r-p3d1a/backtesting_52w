@@ -20,10 +20,11 @@ app.add_middleware(
 )
 security = HTTPBearer()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_KEY = os.getenv("API_KEY")
-CSV_PATH = ".\\db\\max.csv"
-STOCK_PATH = ".\\db\\stock_profile.csv"
-SP500_PATH = ".\\db\\sp500.csv"
+CSV_PATH = os.path.join(BASE_DIR, "db", "max.csv")
+STOCK_PATH = os.path.join(BASE_DIR, "db", "stock_profile.csv")
+SP500_PATH = os.path.join(BASE_DIR, "db", "sp500.csv")
 STOCK_PROFILE_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_profile.parquet"
 STOCK_PRICES_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_prices.parquet"
 
@@ -343,7 +344,7 @@ async def get_performance_ticker(
     if not ((PRICE_DATA["TICKER"] == ticker) & (pd.to_datetime(PRICE_DATA["FECHA"]) == pd.to_datetime(date))).any():
         raise HTTPException(status_code=400, detail=f"El ticker no cumple la condición de 52W en el {day} del {month} del {year}")
     
-    db = pd.read_parquet(f".\\db\\fragmented\\{str(ticker)[0].lower()}.parquet")
+    db = pd.read_parquet(os.path.join(BASE_DIR, "db", "fragmented", f"{str(ticker)[0].lower()}.parquet"))
 
     mask = (db['TICKER'] == ticker) & (pd.to_datetime(db['FECHA']) == pd.to_datetime(date))
     index = db.index[mask]
