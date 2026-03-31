@@ -362,9 +362,9 @@ async def get_performance_ticker(
         for offset in offsets:
             if (pos+offset < len(db)) and (sp500_index+offset < len(SP500)):
                 precio_final = db.iloc[pos+offset]["CLOSE"]
-                rend_ticker = ((precio_final-precio_inicial)/precio_inicial)*100
+                rend_ticker = ((precio_final-precio_inicial)/precio_inicial)
                 sp500_final = SP500.iloc[sp500_index+offset]["ADJ_CLOSE"]
-                rend_sp500 = ((sp500_final-sp500_inicial)/sp500_inicial)*100
+                rend_sp500 = ((sp500_final-sp500_inicial)/sp500_inicial)
                 alpha = float(rend_ticker) - rend_sp500
                 resultados.append([offset-1, rend_ticker, rend_sp500, alpha])
     
