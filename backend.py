@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import math
 import numpy as np
-import json
 
 load_dotenv()
 app = FastAPI(docs_url=False, title="52W Backtester API", version="1.0.0", description="Consulta de máximos de 52 semanas sobre el mercado americano.")
