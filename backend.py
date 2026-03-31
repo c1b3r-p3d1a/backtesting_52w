@@ -13,8 +13,8 @@ import numpy as np
 load_dotenv()
 app = FastAPI(docs_url=False, title="52W Backtester API", version="1.0.0", description="Consulta de máximos de 52 semanas sobre el mercado americano.")
 origins = [
-    "http://127.0.0.1:3333",
-    "http://localhost:3000",
+    "http://127.0.0.1:8080",
+    "http://localhost:8080",
     "https://52w-signal-insights.vercel.app"
 ]
 app.add_middleware(
@@ -349,9 +349,9 @@ async def get_performance_ticker(
     if not ((PRICE_DATA["TICKER"] == ticker) & (pd.to_datetime(PRICE_DATA["FECHA"]) == pd.to_datetime(date))).any():
         raise HTTPException(status_code=400, detail=f"El ticker no cumple la condición de 52W en el {day} del {month} del {year}")
     
-    db = pd.read_parquet(os.path.join(BASE_DIR, "db", "fragmented", f"{str(ticker)[0].lower()}.parquet"))
+    db = pd.read_parquet(os.path.join(BASE_DIR, "db", "fragmented", f"{str(ticker)[0].lower()}", f"{str(ticker)[1].lower()}.parquet"))
 
-    mask = (db['TICKER'] == ticker) & (pd.to_datetime(db['FECHA']) == pd.to_datetime(date))
+    mask = (db['symbol'] == ticker) & (pd.to_datetime(db['report_date']) == pd.to_datetime(date))
     index = db.index[mask]
     
     offsets = list(range(8, 253, 7))
@@ -362,11 +362,11 @@ async def get_performance_ticker(
         pos = db.index.get_loc(index)
         sp500_index = await sp500_by_date(day, month, year)
         sp500_index = sp500_index[0][0]
-        precio_inicial = db.iloc[pos+1]["OPEN"]
+        precio_inicial = db.iloc[pos+1]["open"]
         sp500_inicial = SP500.iloc[sp500_index+1]["ADJ_CLOSE"]
         for offset in offsets:
             if (pos+offset < len(db)) and (sp500_index+offset < len(SP500)):
-                precio_final = db.iloc[pos+offset]["CLOSE"]
+                precio_final = db.iloc[pos+offset]["close"]
                 rend_ticker = ((precio_final-precio_inicial)/precio_inicial)
                 sp500_final = SP500.iloc[sp500_index+offset]["ADJ_CLOSE"]
                 rend_sp500 = ((sp500_final-sp500_inicial)/sp500_inicial)
