@@ -3,6 +3,7 @@ split_parquet_nested.py
 -----------------------
 Lee un archivo .parquet y lo fragmenta en múltiples carpetas y archivos según
 la primera y segunda letra del símbolo (ticker), usando chunks para memoria eficiente.
+Tickers de un solo carácter se guardan en <primera_letra>/_.parquet
 
 Uso:
     python split_parquet_nested.py <input.parquet> [output_dir]
@@ -26,7 +27,7 @@ COLUMN_RENAME = {
     "volume":      "VOLUME",
 }
 
-VALID_CHARS = [c for c in "abcdefghijklmnopqrstuvwxyz0123456789"]
+VALID_CHARS = [c for c in "abcdefghijklmnopqrstuvwxyz0123456789"] + ["_"]
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -56,8 +57,11 @@ def load_and_prepare_chunks(input_path: str, batch_size=100_000):
                       desc="Leyendo parquet"):
         df = batch.to_pandas()
         df["_first_char"] = df["symbol"].str[0].str.lower()
-        df["_second_char"] = df["symbol"].str[1].str.lower()
-        yield df  # devuelve chunk listo para procesar
+        # Tickers de un solo carácter usan "_" como segunda letra
+        df["_second_char"] = df["symbol"].apply(
+            lambda s: s[1].lower() if len(str(s)) > 1 else "_"
+        )
+        yield df
 
 def write_nested_partitions(df: pd.DataFrame, output_dir: str):
     """Fragmenta un chunk de DataFrame por primera y segunda letra y guarda los parquet."""
@@ -72,12 +76,13 @@ def write_nested_partitions(df: pd.DataFrame, output_dir: str):
         os.makedirs(first_dir, exist_ok=True)
 
         for second in VALID_CHARS:
-            df_second = df_first[df_first["_second_char"] == second].drop(columns=["_first_char", "_second_char"])
+            df_second = df_first[df_first["_second_char"] == second].drop(
+                columns=["_first_char", "_second_char"]
+            )
             if df_second.empty:
                 continue
 
             out_path = os.path.join(first_dir, f"{second}.parquet")
-            # Si ya existe, lo añadimos; si no, lo creamos
             if os.path.exists(out_path):
                 df_existing = pd.read_parquet(out_path)
                 df_second = pd.concat([df_existing, df_second], ignore_index=True)
@@ -96,7 +101,6 @@ def main():
     print(f"\n🔀 Fragmentando en carpetas por primera y segunda letra: {output_dir}\n")
     total_created = []
 
-    # ✅ procesamos chunk por chunk para evitar concatenar todo en memoria
     for df_chunk in load_and_prepare_chunks(input_path):
         created = write_nested_partitions(df_chunk, output_dir)
         total_created.extend(created)

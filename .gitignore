@@ -5,3 +5,5 @@ __pycache__/
 validacion_db/
 freezed/
 frontend/
+db/*.parquet
+db/historico_completo.csv

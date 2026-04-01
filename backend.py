@@ -349,7 +349,10 @@ async def get_performance_ticker(
     if not ((PRICE_DATA["TICKER"] == ticker) & (pd.to_datetime(PRICE_DATA["FECHA"]) == pd.to_datetime(date))).any():
         raise HTTPException(status_code=400, detail=f"El ticker no cumple la condición de 52W en el {day} del {month} del {year}")
     
-    db = pd.read_parquet(os.path.join(BASE_DIR, "db", "fragmented", f"{str(ticker)[0].lower()}", f"{str(ticker)[1].lower()}.parquet"))
+    if len(str(ticker)) < 2:
+        db = pd.read_parquet(os.path.join(BASE_DIR, "db", "fragmented", f"{str(ticker)[0].lower()}", f"_.parquet"))
+    else:
+        db = pd.read_parquet(os.path.join(BASE_DIR, "db", "fragmented", f"{str(ticker)[0].lower()}", f"{str(ticker)[1].lower()}.parquet"))
 
     mask = (db['symbol'] == ticker) & (pd.to_datetime(db['report_date']) == pd.to_datetime(date))
     index = db.index[mask]
