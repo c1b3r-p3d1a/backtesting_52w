@@ -6,3 +6,4 @@ uvicorn==0.40.0
 python-dotenv==1.2.2
 duckdb==1.4.3
 pyarrow==23.0.1
+tools==1.0.23
