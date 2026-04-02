@@ -7,3 +7,5 @@ freezed/
 frontend/
 db/*.parquet
 db/historico_completo.csv
+db/rend_year/*.parquet
+tools/*.md

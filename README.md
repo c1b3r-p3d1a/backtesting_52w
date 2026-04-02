@@ -108,8 +108,7 @@ El market cap se calcula como `shares_outstanding × CLOSE` usando la entrada m�
 python backend.py
 ```
 
-Disponible en `http://127.0.0.1:3333`.  
-Documentación: `http://127.0.0.1:3333/redoc`
+Disponible en `http://127.0.0.1:3333`.
 
 ---
 
