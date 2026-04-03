@@ -10,6 +10,8 @@ import uvicorn
 import math
 import numpy as np
 import json
+import duckdb
+import time
 
 load_dotenv()
 app = FastAPI(docs_url=False, title="52W Backtester API", version="1.0.0", description="Consulta de máximos de 52 semanas sobre el mercado americano.")
@@ -464,14 +466,7 @@ async def get_max_year(
 
     return dict(sorted(conteo.items()))
 
-@app.get("/rend_year", tags=["Rendimiento"], summary="Rendimiento agregado año 52W",
-         description=(
-             "Para un año X, toma todas las señales de máximo 52 semanas entre el 01/01/X y el 31/12/X "
-             "y calcula la curva media de rendimiento durante las 252 sesiones posteriores. "
-             "Devuelve la curva global y subconjuntos por capitalización (tomada a inicio de año). "
-             "Cada punto: [sesión_offset, avg_ret_ticker, avg_ret_sp500, alpha]."
-         ),
-         responses={
+@app.get("/rend_year", tags=["Rendimiento"], summary="Rendimiento agregado año 52W", description=("Para un año X, toma todas las señales de máximo 52 semanas entre el 01/01/X y el 31/12/X y calcula la curva media de rendimiento durante las 252 sesiones posteriores. "), responses={
              200: {
                  "description": "Petición exitosa",
                  "content": {
@@ -538,6 +533,374 @@ async def get_performance_year(
             result[cap_key] = curve
 
     return result
+
+@app.get("/analyze", tags=["Analizar"], summary="Analizar en base a alpha", description=r"Permite analizar tendencias en base a un porcentaje X% de alpha", responses={
+        200: {
+            "description": "Petición exitosa",
+            "content": {
+                "application/json": {
+                    "example": []
+                }
+            },
+        },
+        401: {
+            "description": "Token inválido o no autorizado",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Token inválido o no autorizado"}
+                }
+            }
+        },
+        422: {
+            "description": "Error de validación en los parámetros",
+            "content": {
+                "application/json": {
+                    "example": {"detail": [{"loc": ["query", "ticker"], "msg": "Los días no pueden ser más de 253", "type": "not_zero"}]}
+                }
+            }
+        }
+    })
+async def analyze_alpha(
+    year: int = Query(..., ge=2000, description="Año en formato YYYY", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 2021
+                }}),
+    alpha: float = Query(..., description="Porcentaje de alpha a analizar (%)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 1.33
+                }}),
+    period: int = Query(..., ge=1, le=253, description="Periodo a analizar (días de mercado)", openapi_examples={
+                "normal": {
+                    "description": "Ejemplo válido",
+                    "value": 143
+                }}),
+    token: str = Depends(verificar_api_key),):
+    if alpha == 0:
+        raise HTTPException(status_code=422, detail="La entrada no puede ser igual a 0")
+    alpha_p = alpha/100
+
+    if not os.path.exists(os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")):
+        raise HTTPException(status_code=404, detail=f"No hay datos para el año {year}")
+
+    query = f"""
+        WITH base AS (
+            SELECT ticker, fecha, day, alpha
+            FROM '{os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")}'
+            WHERE day <= {period}
+            AND alpha IS NOT NULL
+        ),
+
+        universe AS (
+            SELECT COUNT(DISTINCT (ticker, fecha)) AS total
+            FROM '{os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")}'
+        ),
+
+        qualified AS (
+            SELECT ticker, fecha, MIN(day) AS first_day_above
+            FROM base
+            WHERE alpha > {alpha_p}
+            GROUP BY ticker, fecha
+        ),
+
+        not_qualified AS (
+            SELECT b.ticker, b.fecha, b.alpha
+            FROM base b
+            WHERE NOT EXISTS (
+                SELECT 1 FROM qualified q
+                WHERE q.ticker = b.ticker AND q.fecha = b.fecha
+            )
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY b.ticker, b.fecha
+                ORDER BY b.day DESC
+            ) = 1
+        )
+
+        SELECT
+            COUNT(DISTINCT (q.ticker, q.fecha))                                    AS muestras_que_superan,
+            u.total                                                                AS total_muestras,
+            ROUND(100.0 * COUNT(DISTINCT (q.ticker, q.fecha)) / u.total, 2)       AS pct_superan_Xpct,
+
+            ROUND(AVG(q.first_day_above), 1)                                       AS dias_promedio_hasta_Xpct,
+
+            ROUND(AVG(CASE WHEN nq.alpha < 0 THEN nq.alpha END), 4)               AS alpha_neg_promedio,
+            COUNT(CASE WHEN nq.alpha < 0 THEN 1 END)                              AS n_muestras_alpha_negativo,
+            COUNT(nq.ticker)                                                       AS n_muestras_no_superan
+
+        FROM qualified q
+        FULL JOIN not_qualified nq ON false
+        CROSS JOIN universe u
+        GROUP BY u.total
+    """
+
+    result = duckdb.query(query).fetchone()
+    (
+        muestras_que_superan,
+        total_muestras,
+        pct_superan_Xpct,
+        dias_promedio_hasta_Xpct,
+        alpha_neg_promedio,
+        n_muestras_alpha_negativo,
+        muestras_que_no_superan
+    ) = result 
+
+    return [muestras_que_superan, muestras_que_no_superan, total_muestras, pct_superan_Xpct, dias_promedio_hasta_Xpct, alpha_neg_promedio, n_muestras_alpha_negativo]
+
+@app.get("/optimize", tags=["Optimizar"], summary="Optimizar umbral alpha y periodo de tenencia", description=(
+        "Busca por grid search la combinación óptima de umbral alpha X% y periodo Y días "
+        "que maximiza la TIR ponderada de cartera:\n\n"
+        "**TIR_cartera = w_pos × TIR_pos − w_neg × TIR_neg**\n\n"
+        "- **Grupo positivo**: señales que en algún momento dentro del periodo Y superaron X% de alpha → LONG\n"
+        "- **Grupo negativo**: señales que nunca lo superaron → SHORT (o evitar)\n"
+        "- TIR = retorno acumulado vs S&P500 al final del periodo (anualizable para comparar entre periodos)\n\n"
+        "Algoritmo: carga la matriz de alphas granulares en NumPy, precomputa el cumulative-max "
+        "una sola vez y barre todo el grid sin loops Python sobre señales individuales."
+    ),
+    responses={
+        200: {
+            "description": "Resultado de optimización",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "año": 2021,
+                        "mejor_combinacion": {
+                            "alpha_pct": 4.5,
+                            "period_dias": 85,
+                            "score": 0.312,
+                            "tir_pos_pct": 28.4,
+                            "tir_neg_pct": -12.1,
+                            "tir_cartera_pct": 18.7,
+                            "n_pos": 4231,
+                            "n_neg": 9812,
+                            "pct_seniales_positivas": 30.1,
+                            "n_total_valido": 14043
+                        },
+                        "top": [],
+                        "stats": {
+                            "combinaciones_evaluadas": 1960,
+                            "n_seniales_totales": 14043,
+                            "tiempo_ejecucion_s": 2.14
+                        }
+                    }
+                }
+            }
+        },
+        401: {"description": "Token inválido", "content": {"application/json": {"example": {"detail": "Token inválido o no autorizado"}}}},
+        404: {"description": "Sin datos granulares para el año", "content": {"application/json": {"example": {"detail": "No hay datos granulares para 2026"}}}},
+        422: {"description": "Parámetros inválidos", "content": {"application/json": {"example": {"detail": "alpha_min debe ser estrictamente menor que alpha_max"}}}}
+    }
+)
+async def optimize_alpha_period(
+    year: int = Query(..., ge=2000, le=2025, description="Año a optimizar"),
+    min_samples: int = Query(
+        default=30, ge=5, le=10_000,
+        description="Mínimo de señales válidas por grupo para considerar la combinación"
+    ),
+    alpha_min: float = Query(
+        default=0.5, ge=0.1, le=99.0,
+        description="Umbral alpha mínimo del grid (%)"
+    ),
+    alpha_max: float = Query(
+        default=25.0, ge=0.5, le=200.0,
+        description="Umbral alpha máximo del grid (%)"
+    ),
+    alpha_step: float = Query(
+        default=0.5, ge=0.1, le=10.0,
+        description="Paso entre umbrales de alpha (%)"
+    ),
+    period_min: int = Query(
+        default=10, ge=1, le=252,
+        description="Periodo mínimo del grid (días de mercado)"
+    ),
+    period_max: int = Query(
+        default=252, ge=1, le=252,
+        description="Periodo máximo del grid (días de mercado)"
+    ),
+    period_step: int = Query(
+        default=5, ge=1, le=50,
+        description="Paso entre periodos (días de mercado)"
+    ),
+    top_n: int = Query(
+        default=10, ge=1, le=100,
+        description="Número de mejores combinaciones a devolver en el ranking"
+    ),
+    annualize: bool = Query(
+        default=True,
+        description=(
+            "Si True, anualiza las TIR antes de puntuar "
+            "((1+r)^(252/Y)−1) para comparar periodos en igualdad de condiciones. "
+            "Si False, usa el retorno acumulado bruto al final del periodo."
+        )
+    ),
+    token: str = Depends(verificar_api_key),
+):
+    t0 = time.time()
+
+    if alpha_min >= alpha_max:
+        raise HTTPException(
+            status_code=422,
+            detail="alpha_min debe ser estrictamente menor que alpha_max"
+        )
+    if period_min > period_max:
+        raise HTTPException(
+            status_code=422,
+            detail="period_min debe ser <= period_max"
+        )
+
+    parquet_path = os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")
+    if not os.path.exists(parquet_path):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No hay datos granulares para el año {year}. "
+                "Ejecuta primero precompute_granular_alpha.py."
+            )
+        )
+
+    n_alphas = max(1, round((alpha_max - alpha_min) / alpha_step) + 1)
+    alphas_grid = np.linspace(alpha_min, alpha_min + alpha_step * (n_alphas - 1), n_alphas)
+
+    periods_list = list(range(period_min, period_max + 1, period_step))
+    if not periods_list or periods_list[-1] != period_max:
+        periods_list.append(period_max)
+    periods_grid = np.array(periods_list, dtype=np.int32)
+
+    MAX_COMBINATIONS = 100_000
+    total_combos = len(alphas_grid) * len(periods_grid)
+    if total_combos > MAX_COMBINATIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Grid demasiado grande ({len(alphas_grid)} alphas × {len(periods_grid)} periodos "
+                f"= {total_combos:,} combinaciones). "
+                f"Máximo permitido: {MAX_COMBINATIONS:,}. "
+                "Reduce el rango o aumenta el paso."
+            )
+        )
+
+    df = pd.read_parquet(parquet_path, columns=["ticker", "fecha", "day", "alpha"])
+
+    df["_sig"] = df["ticker"] + "|" + df["fecha"]
+    sig_codes, sig_uniques = pd.factorize(df["_sig"])
+    n_signals = len(sig_uniques)
+
+    mat = np.full((n_signals, 252), np.nan, dtype=np.float32)
+
+    days_idx = df["day"].to_numpy(dtype=np.int32) - 1
+    alpha_vals = df["alpha"].to_numpy(dtype=np.float32)
+
+    valid = (days_idx >= 0) & (days_idx < 252)
+    mat[sig_codes[valid], days_idx[valid]] = alpha_vals[valid]
+
+    del df, sig_codes, sig_uniques, days_idx, alpha_vals, valid
+
+    mat_filled = np.where(np.isnan(mat), np.float32(-np.inf), mat)
+    cum_max = np.maximum.accumulate(mat_filled, axis=1)
+    del mat_filled
+
+    TRADING_DAYS = 252.0
+    results: list[dict] = []
+
+    for period in periods_grid:
+        Y = int(period) - 1
+        if Y < 0 or Y >= 252:
+            continue
+
+        max_window = cum_max[:, Y]
+        alpha_end  = mat[:, Y]
+
+        finite_mask = np.isfinite(alpha_end)
+
+        mw_f  = max_window[finite_mask].astype(np.float64)
+        ae_f  = alpha_end[finite_mask].astype(np.float64)
+        n_fin = len(ae_f)
+
+        if n_fin < 2 * min_samples:
+            continue
+
+        ann_exp = TRADING_DAYS / float(period) if annualize else None
+
+        for alpha_pct in alphas_grid:
+            alpha_val = float(alpha_pct) / 100.0
+
+            q_mask = mw_f > alpha_val
+
+            pos_alpha = ae_f[q_mask]
+            neg_alpha = ae_f[~q_mask]
+
+            n_pos = len(pos_alpha)
+            n_neg = len(neg_alpha)
+
+            if n_pos < min_samples or n_neg < min_samples:
+                continue
+
+            avg_pos_raw = float(np.mean(pos_alpha))
+            avg_neg_raw = float(np.mean(neg_alpha))
+
+            if annualize:
+                avg_pos = (1.0 + max(-0.9999, min(avg_pos_raw, 100.0))) ** ann_exp - 1.0
+                avg_neg = (1.0 + max(-0.9999, min(avg_neg_raw, 100.0))) ** ann_exp - 1.0
+            else:
+                avg_pos = avg_pos_raw
+                avg_neg = avg_neg_raw
+
+            n_total = n_pos + n_neg
+            w_pos = n_pos / n_total
+            w_neg = n_neg / n_total
+
+            score = w_pos * avg_pos - w_neg * avg_neg
+
+            results.append({
+                "alpha_pct":               round(float(alpha_pct), 2),
+                "period_dias":             int(period),
+                "score":                   round(score, 8),
+                "tir_pos_pct":             round(avg_pos * 100.0, 4),
+                "tir_neg_pct":             round(avg_neg * 100.0, 4),
+                "tir_cartera_pct":         round((w_pos * avg_pos - w_neg * avg_neg) * 100.0, 4),
+                "tir_pos_crudo_pct":       round(avg_pos_raw * 100.0, 4),
+                "tir_neg_crudo_pct":       round(avg_neg_raw * 100.0, 4),
+                "n_pos":                   n_pos,
+                "n_neg":                   n_neg,
+                "pct_seniales_positivas":  round(100.0 * w_pos, 2),
+                "n_total_valido":          n_total,
+            })
+
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No se encontraron combinaciones con muestras suficientes. "
+                "Prueba a reducir min_samples, ampliar los rangos de alpha/periodo "
+                "o verificar que el archivo granular contiene datos."
+            )
+        )
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    best = results[0]
+
+    elapsed = round(time.time() - t0, 3)
+
+    return {
+        "año":                 year,
+        "mejor_combinacion":   best,
+        "top":                 results[:top_n],
+        "stats": {
+            "combinaciones_evaluadas": len(results),
+            "n_seniales_totales":      n_signals,
+            "tiempo_ejecucion_s":      elapsed,
+            "annualize":               annualize,
+        },
+        "parametros_busqueda": {
+            "alpha_min_pct":   round(float(alpha_min), 2),
+            "alpha_max_pct":   round(float(alpha_max), 2),
+            "alpha_step_pct":  round(float(alpha_step), 2),
+            "period_min":      int(period_min),
+            "period_max":      int(period_max),
+            "period_step":     int(period_step),
+            "min_samples":     min_samples,
+        },
+    }
 
 if __name__ == "__main__":
     clean_screen()
