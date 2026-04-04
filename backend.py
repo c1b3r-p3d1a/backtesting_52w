@@ -23,8 +23,8 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_methods=["GET"],
-    allow_headers=["Authorization"],
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"]
 )
 security = HTTPBearer()
 
@@ -36,6 +36,8 @@ SP500_PATH = os.path.join(BASE_DIR, "db", "sp500.csv")
 STOCK_PROFILE_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_profile.parquet"
 STOCK_PRICES_URL = "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_prices.parquet"
 REND_DIR = os.path.join(BASE_DIR, "db", "rend_year")
+
+TRADING_DAYS = 252.0
 
 print("[+] Leyendo ficheros CSV")
 PRICE_DATA = pd.read_csv(CSV_PATH, sep=",", encoding="utf-8")
@@ -60,6 +62,68 @@ def limpiar_valores(x):
 
 def clean_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
+
+def _winsorize(arr: np.ndarray, lo: float = 1.0, hi: float = 99.0) -> np.ndarray:
+    """Winsoriza en percentiles [lo, hi]. Seguro con arrays pequeños."""
+    if len(arr) < 10:
+        return arr
+    lo_val, hi_val = np.percentile(arr, [lo, hi])
+    return np.clip(arr, lo_val, hi_val)
+
+def _safe_annualize(r_raw: float, period: int) -> float:
+    """
+    Anualiza un retorno acumulado bruto con tres capas de protección:
+      1. Clamp del retorno bruto a [-99.99%, +500%] antes de exponenciar.
+         (500% raw en N días sigue siendo un outlier extremo; por encima
+         la anualización es artefacto, no señal.)
+      2. Usa log/exp en vez de potencia directa → sin OverflowError.
+      3. Clamp del resultado anualizado a [-100%, +10 000%].
+    """
+    r_clipped = max(-0.9999, min(r_raw, 5.0))          # capa 1: cap raw ±
+    log_ann   = np.log1p(r_clipped) * (TRADING_DAYS / float(period))  # capa 2: log-space
+    result    = np.expm1(np.clip(log_ann, -20.0, 20.0))               # capa 3: exp clamp
+    return float(result)
+
+def _sharpe(returns: np.ndarray, period: int, annualize: bool, rf_annual: float = 0.0) -> float:
+    """Sharpe del portfolio sobre la distribución de retornos individuales."""
+    rf_period = (1.0 + rf_annual) ** (float(period) / TRADING_DAYS) - 1.0
+    excess = returns - rf_period
+    std = float(np.std(excess))
+    if std < 1e-9:
+        return 0.0
+    s = float(np.mean(excess)) / std
+    return s * float(np.sqrt(TRADING_DAYS / period)) if annualize else s
+
+def _geo_mean_return(returns: np.ndarray) -> float:
+    """Media geométrica de retornos: exp(mean(log(1+r))) - 1.
+    Más precisa que np.mean para anualizar retornos compuestos."""
+    clipped = np.clip(returns, -0.9999, None)
+    return float(np.expm1(np.mean(np.log1p(clipped))))
+
+def _load_granular(year: int, rend_dir: str) -> pd.DataFrame:
+    path = os.path.join(rend_dir, f"granular_alpha_{year}.parquet")
+    if not os.path.exists(path):
+        raise HTTPException(404, f"No hay datos granulares para {year}")
+    return pd.read_parquet(path, columns=["ticker", "fecha", "day", "alpha"])
+
+def _build_matrix(df: pd.DataFrame):
+    """
+    Convierte el DataFrame en una matriz (n_señales × 252) de alphas.
+    Devuelve (mat, cum_max, n_signals).
+    """
+    df["_sig"]            = df["ticker"] + "|" + df["fecha"]
+    sig_codes, sig_uniq  = pd.factorize(df["_sig"])
+    n_signals             = len(sig_uniq)
+
+    mat      = np.full((n_signals, 252), np.nan, dtype=np.float32)
+    days_idx = df["day"].to_numpy(dtype=np.int32) - 1
+    alpha_v  = df["alpha"].to_numpy(dtype=np.float32)
+    valid    = (days_idx >= 0) & (days_idx < 252)
+    mat[sig_codes[valid], days_idx[valid]] = alpha_v[valid]
+
+    mat_filled = np.where(np.isnan(mat), np.float32(-np.inf), mat)
+    cum_max    = np.maximum.accumulate(mat_filled, axis=1)
+    return mat, cum_max, n_signals
 
 @app.get("/date", tags=["Máximos 52W"], summary="Máximo 52W Fecha", description="De una fecha, obtiene todas las empresas (tickers) en las que tuvieron su mayor HIGH en esa sesión respecto a sus 252 sesiones anteriores.", responses={
         200: {
@@ -534,332 +598,346 @@ async def get_performance_year(
 
     return result
 
-@app.get("/analyze", tags=["Analizar"], summary="Analizar en base a alpha", description=r"Permite analizar tendencias en base a un porcentaje X% de alpha", responses={
-        200: {
-            "description": "Petición exitosa",
-            "content": {
-                "application/json": {
-                    "example": []
-                }
-            },
-        },
-        401: {
-            "description": "Token inválido o no autorizado",
-            "content": {
-                "application/json": {
-                    "example": {"detail": "Token inválido o no autorizado"}
-                }
-            }
-        },
-        422: {
-            "description": "Error de validación en los parámetros",
-            "content": {
-                "application/json": {
-                    "example": {"detail": [{"loc": ["query", "ticker"], "msg": "Los días no pueden ser más de 253", "type": "not_zero"}]}
-                }
-            }
-        }
-    })
+@app.get("/analyze", tags=["Analizar"], summary="Analizar en base a alpha",
+         description="Permite analizar tendencias en base a un porcentaje X% de alpha",
+         responses={
+             200: {"description": "Petición exitosa", "content": {"application/json": {
+                 "example": {
+                     "muestras_que_superan": 1240,
+                     "muestras_que_no_superan": 8760,
+                     "total_muestras": 10000,
+                     "pct_superan_Xpct": 12.4,
+                     "dias_promedio_hasta_Xpct": 47.3,
+                     "alpha_neg_promedio": -0.0312,
+                     "n_muestras_alpha_negativo": 4102,
+                 }}}},
+             401: {"description": "Token inválido o no autorizado"},
+             404: {"description": "Sin datos para el año solicitado"},
+             422: {"description": "Error de validación"},
+         })
 async def analyze_alpha(
-    year: int = Query(..., ge=2000, description="Año en formato YYYY", openapi_examples={
-                "normal": {
-                    "description": "Ejemplo válido",
-                    "value": 2021
-                }}),
-    alpha: float = Query(..., description="Porcentaje de alpha a analizar (%)", openapi_examples={
-                "normal": {
-                    "description": "Ejemplo válido",
-                    "value": 1.33
-                }}),
-    period: int = Query(..., ge=1, le=253, description="Periodo a analizar (días de mercado)", openapi_examples={
-                "normal": {
-                    "description": "Ejemplo válido",
-                    "value": 143
-                }}),
-    token: str = Depends(verificar_api_key),):
+    year:   int   = Query(..., ge=2000, description="Año YYYY"),
+    alpha:  float = Query(..., description="Umbral alpha (%)"),
+    period: int   = Query(..., ge=1, le=253, description="Periodo en días de mercado"),
+    token:  str   = Depends(verificar_api_key),
+):
     if alpha == 0:
-        raise HTTPException(status_code=422, detail="La entrada no puede ser igual a 0")
-    alpha_p = alpha/100
+        raise HTTPException(422, "alpha no puede ser 0")
 
-    if not os.path.exists(os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")):
-        raise HTTPException(status_code=404, detail=f"No hay datos para el año {year}")
+    alpha_p      = alpha / 100.0
+    parquet_path = os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")
+    if not os.path.exists(parquet_path):
+        raise HTTPException(404, f"No hay datos para el año {year}")
 
     query = f"""
         WITH base AS (
             SELECT ticker, fecha, day, alpha
-            FROM '{os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")}'
+            FROM read_parquet('{parquet_path}')
             WHERE day <= {period}
-            AND alpha IS NOT NULL
+              AND alpha IS NOT NULL
         ),
-
         universe AS (
             SELECT COUNT(DISTINCT (ticker, fecha)) AS total
-            FROM '{os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")}'
+            FROM read_parquet('{parquet_path}')
         ),
-
-        qualified AS (
-            SELECT ticker, fecha, MIN(day) AS first_day_above
+        signal_stats AS (
+            SELECT
+                ticker,
+                fecha,
+                LAST(alpha ORDER BY day)                          AS last_alpha,
+                MIN(CASE WHEN alpha > {alpha_p} THEN day END)     AS first_day_above
             FROM base
-            WHERE alpha > {alpha_p}
             GROUP BY ticker, fecha
-        ),
-
-        not_qualified AS (
-            SELECT b.ticker, b.fecha, b.alpha
-            FROM base b
-            WHERE NOT EXISTS (
-                SELECT 1 FROM qualified q
-                WHERE q.ticker = b.ticker AND q.fecha = b.fecha
-            )
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY b.ticker, b.fecha
-                ORDER BY b.day DESC
-            ) = 1
         )
-
         SELECT
-            COUNT(DISTINCT (q.ticker, q.fecha))                                    AS muestras_que_superan,
-            u.total                                                                AS total_muestras,
-            ROUND(100.0 * COUNT(DISTINCT (q.ticker, q.fecha)) / u.total, 2)       AS pct_superan_Xpct,
-
-            ROUND(AVG(q.first_day_above), 1)                                       AS dias_promedio_hasta_Xpct,
-
-            ROUND(AVG(CASE WHEN nq.alpha < 0 THEN nq.alpha END), 4)               AS alpha_neg_promedio,
-            COUNT(CASE WHEN nq.alpha < 0 THEN 1 END)                              AS n_muestras_alpha_negativo,
-            COUNT(nq.ticker)                                                       AS n_muestras_no_superan
-
-        FROM qualified q
-        FULL JOIN not_qualified nq ON false
+            COUNT(CASE WHEN first_day_above IS NOT NULL THEN 1 END)
+                                                                    AS muestras_que_superan,
+            u.total                                                 AS total_muestras,
+            ROUND(
+                100.0 * COUNT(CASE WHEN first_day_above IS NOT NULL THEN 1 END)
+                / NULLIF(u.total, 0), 2)                            AS pct_superan_Xpct,
+            ROUND(AVG(
+                CASE WHEN first_day_above IS NOT NULL
+                     THEN first_day_above END), 1)                  AS dias_promedio_hasta_Xpct,
+            ROUND(AVG(
+                CASE WHEN first_day_above IS NULL AND last_alpha < 0
+                     THEN last_alpha END), 4)                       AS alpha_neg_promedio,
+            COUNT(CASE WHEN first_day_above IS NULL AND last_alpha < 0
+                       THEN 1 END)                                  AS n_muestras_alpha_negativo,
+            COUNT(CASE WHEN first_day_above IS NULL THEN 1 END)     AS n_muestras_no_superan
+        FROM signal_stats
         CROSS JOIN universe u
         GROUP BY u.total
     """
 
-    result = duckdb.query(query).fetchone()
-    (
-        muestras_que_superan,
-        total_muestras,
-        pct_superan_Xpct,
-        dias_promedio_hasta_Xpct,
-        alpha_neg_promedio,
-        n_muestras_alpha_negativo,
-        muestras_que_no_superan
-    ) = result 
+    row = duckdb.query(query).fetchone()
+    if row is None:
+        raise HTTPException(404, "La query no devolvió resultados")
 
-    return [muestras_que_superan, muestras_que_no_superan, total_muestras, pct_superan_Xpct, dias_promedio_hasta_Xpct, alpha_neg_promedio, n_muestras_alpha_negativo]
+    (muestras_que_superan, total_muestras, pct_superan_Xpct,
+     dias_promedio_hasta_Xpct, alpha_neg_promedio,
+     n_muestras_alpha_negativo, muestras_que_no_superan) = row
 
-@app.get("/optimize", tags=["Optimizar"], summary="Optimizar umbral alpha y periodo de tenencia", description=(
-        "Busca por grid search la combinación óptima de umbral alpha X% y periodo Y días "
-        "que maximiza la TIR ponderada de cartera:\n\n"
-        "**TIR_cartera = w_pos × TIR_pos − w_neg × TIR_neg**\n\n"
-        "- **Grupo positivo**: señales que en algún momento dentro del periodo Y superaron X% de alpha → LONG\n"
-        "- **Grupo negativo**: señales que nunca lo superaron → SHORT (o evitar)\n"
-        "- TIR = retorno acumulado vs S&P500 al final del periodo (anualizable para comparar entre periodos)\n\n"
-        "Algoritmo: carga la matriz de alphas granulares en NumPy, precomputa el cumulative-max "
-        "una sola vez y barre todo el grid sin loops Python sobre señales individuales."
-    ),
-    responses={
-        200: {
-            "description": "Resultado de optimización",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "año": 2021,
-                        "mejor_combinacion": {
-                            "alpha_pct": 4.5,
-                            "period_dias": 85,
-                            "score": 0.312,
-                            "tir_pos_pct": 28.4,
-                            "tir_neg_pct": -12.1,
-                            "tir_cartera_pct": 18.7,
-                            "n_pos": 4231,
-                            "n_neg": 9812,
-                            "pct_seniales_positivas": 30.1,
-                            "n_total_valido": 14043
-                        },
-                        "top": [],
-                        "stats": {
-                            "combinaciones_evaluadas": 1960,
-                            "n_seniales_totales": 14043,
-                            "tiempo_ejecucion_s": 2.14
-                        }
-                    }
-                }
-            }
-        },
-        401: {"description": "Token inválido", "content": {"application/json": {"example": {"detail": "Token inválido o no autorizado"}}}},
-        404: {"description": "Sin datos granulares para el año", "content": {"application/json": {"example": {"detail": "No hay datos granulares para 2026"}}}},
-        422: {"description": "Parámetros inválidos", "content": {"application/json": {"example": {"detail": "alpha_min debe ser estrictamente menor que alpha_max"}}}}
+    return {
+        "año":                       year,
+        "alpha_pct":                 alpha,
+        "period_dias":               period,
+        "muestras_que_superan":      muestras_que_superan,
+        "muestras_que_no_superan":   muestras_que_no_superan,
+        "total_muestras":            total_muestras,
+        "pct_superan_Xpct":          pct_superan_Xpct,
+        "dias_promedio_hasta_Xpct":  dias_promedio_hasta_Xpct,
+        "alpha_neg_promedio":        alpha_neg_promedio,
+        "n_muestras_alpha_negativo": n_muestras_alpha_negativo,
     }
+
+@app.get("/analyze/multi", tags=["Analizar"],
+         summary="Analizar alpha en rango de años",
+         description=(
+             "Ejecuta `/analyze` para cada año en [year_from, year_to] y devuelve "
+             "resultados por año + resumen agregado. Permite ver consistencia histórica."
+         ))
+async def analyze_alpha_multi(
+    year_from: int   = Query(..., ge=2000, le=2025, description="Año inicio"),
+    year_to:   int   = Query(..., ge=2000, le=2025, description="Año fin (inclusive)"),
+    alpha:     float = Query(..., description="Umbral alpha (%)"),
+    period:    int   = Query(..., ge=1, le=253, description="Periodo en días de mercado"),
+    token:     str   = Depends(verificar_api_key),
+):
+    if year_from > year_to:
+        raise HTTPException(422, "year_from debe ser <= year_to")
+    if alpha == 0:
+        raise HTTPException(422, "alpha no puede ser 0")
+
+    alpha_p    = alpha / 100.0
+    años       = range(year_from, year_to + 1)
+    por_año    = {}
+    pcts_lista = []
+    dias_lista = []
+
+    for year in años:
+        parquet_path = os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")
+        if not os.path.exists(parquet_path):
+            por_año[year] = {"error": f"Sin datos para {year}"}
+            continue
+
+        query = f"""
+            WITH base AS (
+                SELECT ticker, fecha, day, alpha
+                FROM read_parquet('{parquet_path}')
+                WHERE day <= {period} AND alpha IS NOT NULL
+            ),
+            universe AS (
+                SELECT COUNT(DISTINCT (ticker, fecha)) AS total
+                FROM read_parquet('{parquet_path}')
+            ),
+            signal_stats AS (
+                SELECT
+                    ticker, fecha,
+                    LAST(alpha ORDER BY day)                      AS last_alpha,
+                    MIN(CASE WHEN alpha > {alpha_p} THEN day END) AS first_day_above
+                FROM base
+                GROUP BY ticker, fecha
+            )
+            SELECT
+                COUNT(CASE WHEN first_day_above IS NOT NULL THEN 1 END),
+                u.total,
+                ROUND(100.0 * COUNT(CASE WHEN first_day_above IS NOT NULL THEN 1 END)
+                      / NULLIF(u.total, 0), 2),
+                ROUND(AVG(CASE WHEN first_day_above IS NOT NULL THEN first_day_above END), 1),
+                ROUND(AVG(CASE WHEN first_day_above IS NULL AND last_alpha < 0
+                               THEN last_alpha END), 4),
+                COUNT(CASE WHEN first_day_above IS NULL AND last_alpha < 0 THEN 1 END),
+                COUNT(CASE WHEN first_day_above IS NULL THEN 1 END)
+            FROM signal_stats CROSS JOIN universe u
+            GROUP BY u.total
+        """
+        row = duckdb.query(query).fetchone()
+        if row is None:
+            por_año[year] = {"error": "Sin resultados"}
+            continue
+
+        (mq, total, pct, dias, ang, nmng, mnq) = row
+        por_año[year] = {
+            "muestras_que_superan":      mq,
+            "muestras_que_no_superan":   mnq,
+            "total_muestras":            total,
+            "pct_superan_Xpct":          pct,
+            "dias_promedio_hasta_Xpct":  dias,
+            "alpha_neg_promedio":        ang,
+            "n_muestras_alpha_negativo": nmng,
+        }
+        if pct is not None:
+            pcts_lista.append(pct)
+        if dias is not None:
+            dias_lista.append(dias)
+
+    años_con_datos = [y for y in años if "error" not in por_año.get(y, {})]
+    resumen = {
+        "años_con_datos":           len(años_con_datos),
+        "años_sin_datos":           len(años) - len(años_con_datos),
+        "pct_superan_promedio":     round(float(np.mean(pcts_lista)), 2)  if pcts_lista else None,
+        "pct_superan_mediana":      round(float(np.median(pcts_lista)), 2) if pcts_lista else None,
+        "pct_superan_std":          round(float(np.std(pcts_lista)), 2)   if pcts_lista else None,
+        "dias_promedio_global":     round(float(np.mean(dias_lista)), 1)  if dias_lista else None,
+        "consistencia_pct_positivo": (
+            round(100.0 * sum(1 for p in pcts_lista if p > 0) / len(pcts_lista), 1)
+            if pcts_lista else None
+        ),
+    }
+
+    return {
+        "alpha_pct":    alpha,
+        "period_dias":  period,
+        "resultados":   por_año,
+        "resumen":      resumen,
+    }
+
+@app.get("/optimize", tags=["Optimizar"],
+         summary="Optimizar umbral alpha y periodo de tenencia",
+         description=(
+             "Grid search sobre (alpha%, periodo) que maximiza la TIR ponderada L/S.\n\n"
+             "**Novedades v2:**\n"
+             "- Winsorización p1-p99 antes de promediar → elimina outliers que causaban TIR ×10¹⁸⁸\n"
+             "- `_safe_annualize` con log/exp y triple capa de clamp\n"
+             "- Sharpe ratio del portfolio long-short\n"
+             "- Win rate por grupo\n"
+             "- Modelado de costes de transacción (`cost_bps`)"
+             "- **Grupo negativo**: señales que nunca lo superaron → CORTO vía futuro S&P 500 "
+             "(muy líquido, coste mínimo incluido en cost_bps)\n"
+         )
 )
 async def optimize_alpha_period(
-    year: int = Query(..., ge=2000, le=2025, description="Año a optimizar"),
-    min_samples: int = Query(
-        default=30, ge=5, le=10_000,
-        description="Mínimo de señales válidas por grupo para considerar la combinación"
-    ),
-    alpha_min: float = Query(
-        default=0.5, ge=0.1, le=99.0,
-        description="Umbral alpha mínimo del grid (%)"
-    ),
-    alpha_max: float = Query(
-        default=25.0, ge=0.5, le=200.0,
-        description="Umbral alpha máximo del grid (%)"
-    ),
-    alpha_step: float = Query(
-        default=0.5, ge=0.1, le=10.0,
-        description="Paso entre umbrales de alpha (%)"
-    ),
-    period_min: int = Query(
-        default=10, ge=1, le=252,
-        description="Periodo mínimo del grid (días de mercado)"
-    ),
-    period_max: int = Query(
-        default=252, ge=1, le=252,
-        description="Periodo máximo del grid (días de mercado)"
-    ),
-    period_step: int = Query(
-        default=5, ge=1, le=50,
-        description="Paso entre periodos (días de mercado)"
-    ),
-    top_n: int = Query(
-        default=10, ge=1, le=100,
-        description="Número de mejores combinaciones a devolver en el ranking"
-    ),
-    annualize: bool = Query(
-        default=True,
+    year:        int   = Query(..., ge=2000, le=2025),
+    min_samples: int   = Query(default=30, ge=5, le=10_000),
+    alpha_min:   float = Query(default=0.5,  ge=0.1, le=99.0),
+    alpha_max:   float = Query(default=25.0, ge=0.5, le=200.0),
+    alpha_step:  float = Query(default=0.5,  ge=0.1, le=10.0),
+    period_min:  int   = Query(default=10,   ge=1,   le=252),
+    period_max:  int   = Query(default=252,  ge=1,   le=252),
+    period_step: int   = Query(default=5,    ge=1,   le=50),
+    top_n:       int   = Query(default=10,   ge=1,   le=100),
+    annualize:   bool  = Query(default=True),
+    cost_bps: float = Query(default=10.0, ge=0.0, le=50.0,
         description=(
-            "Si True, anualiza las TIR antes de puntuar "
-            "((1+r)^(252/Y)−1) para comparar periodos en igualdad de condiciones. "
-            "Si False, usa el retorno acumulado bruto al final del periodo."
+            "Coste por operación en basis points (bps). "
+            "Se aplica round-trip (entrada + salida) a cada señal: "
+            "cost_rt = 2 × cost_bps / 10 000. "
+            "Descuenta del retorno bruto antes de promediar y anualizar."
         )
+    ),
+    tax_rate: float = Query(
+        default=0.01, ge=0.0, le=0.35,
+        description="Tipo impositivo sobre beneficios (vehículo regulado = 1 % = 0.01)"
+    ),
+    slippage_bps: float = Query(
+        default=5.0, ge=0.0, le=50.0,
+        description="Slippage estimado por operación en bps (round-trip). "
+                    "Líquidas ~3-5 bps, ilíquidas 10-20 bps."
+    ),
+    rf_annual: float = Query(
+        default=0.0, ge=0.0, le=0.20,
+        description="Tasa libre de riesgo anual para el Sharpe (e.g. 0.045 = 4,5 %)"
     ),
     token: str = Depends(verificar_api_key),
 ):
     t0 = time.time()
 
     if alpha_min >= alpha_max:
-        raise HTTPException(
-            status_code=422,
-            detail="alpha_min debe ser estrictamente menor que alpha_max"
-        )
+        raise HTTPException(422, "alpha_min debe ser < alpha_max")
     if period_min > period_max:
-        raise HTTPException(
-            status_code=422,
-            detail="period_min debe ser <= period_max"
-        )
+        raise HTTPException(422, "period_min debe ser <= period_max")
 
-    parquet_path = os.path.join(REND_DIR, f"granular_alpha_{year}.parquet")
-    if not os.path.exists(parquet_path):
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No hay datos granulares para el año {year}. "
-                "Ejecuta primero precompute_granular_alpha.py."
-            )
-        )
+    df = _load_granular(year, REND_DIR)
+    mat, cum_max, n_signals = _build_matrix(df)
+    del df
 
-    n_alphas = max(1, round((alpha_max - alpha_min) / alpha_step) + 1)
+    n_alphas    = max(1, round((alpha_max - alpha_min) / alpha_step) + 1)
     alphas_grid = np.linspace(alpha_min, alpha_min + alpha_step * (n_alphas - 1), n_alphas)
+    periods_lst = list(range(period_min, period_max + 1, period_step))
+    if not periods_lst or periods_lst[-1] != period_max:
+        periods_lst.append(period_max)
+    periods_grid = np.array(periods_lst, dtype=np.int32)
 
-    periods_list = list(range(period_min, period_max + 1, period_step))
-    if not periods_list or periods_list[-1] != period_max:
-        periods_list.append(period_max)
-    periods_grid = np.array(periods_list, dtype=np.int32)
-
-    MAX_COMBINATIONS = 100_000
     total_combos = len(alphas_grid) * len(periods_grid)
-    if total_combos > MAX_COMBINATIONS:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Grid demasiado grande ({len(alphas_grid)} alphas × {len(periods_grid)} periodos "
-                f"= {total_combos:,} combinaciones). "
-                f"Máximo permitido: {MAX_COMBINATIONS:,}. "
-                "Reduce el rango o aumenta el paso."
-            )
-        )
+    if total_combos > 100_000:
+        raise HTTPException(422,
+            f"Grid demasiado grande ({total_combos:,} combinaciones, máx 100 000). "
+            "Reduce rango o aumenta paso.")
 
-    df = pd.read_parquet(parquet_path, columns=["ticker", "fecha", "day", "alpha"])
+    cost_rt     = 2.0 * float(cost_bps)     / 10_000.0
+    slippage_rt = 2.0 * float(slippage_bps) / 10_000.0
+    total_cost  = cost_rt + slippage_rt
 
-    df["_sig"] = df["ticker"] + "|" + df["fecha"]
-    sig_codes, sig_uniques = pd.factorize(df["_sig"])
-    n_signals = len(sig_uniques)
-
-    mat = np.full((n_signals, 252), np.nan, dtype=np.float32)
-
-    days_idx = df["day"].to_numpy(dtype=np.int32) - 1
-    alpha_vals = df["alpha"].to_numpy(dtype=np.float32)
-
-    valid = (days_idx >= 0) & (days_idx < 252)
-    mat[sig_codes[valid], days_idx[valid]] = alpha_vals[valid]
-
-    del df, sig_codes, sig_uniques, days_idx, alpha_vals, valid
-
-    mat_filled = np.where(np.isnan(mat), np.float32(-np.inf), mat)
-    cum_max = np.maximum.accumulate(mat_filled, axis=1)
-    del mat_filled
-
-    TRADING_DAYS = 252.0
     results: list[dict] = []
 
     for period in periods_grid:
         Y = int(period) - 1
-        if Y < 0 or Y >= 252:
+        if Y <= 0 or Y >= 252:    
             continue
 
-        max_window = cum_max[:, Y]
+        max_window = cum_max[:, Y - 1]
         alpha_end  = mat[:, Y]
 
         finite_mask = np.isfinite(alpha_end)
-
-        mw_f  = max_window[finite_mask].astype(np.float64)
-        ae_f  = alpha_end[finite_mask].astype(np.float64)
-        n_fin = len(ae_f)
-
-        if n_fin < 2 * min_samples:
+        mw_f = max_window[finite_mask].astype(np.float64)
+        ae_f = alpha_end[finite_mask].astype(np.float64)
+        if len(ae_f) < 2 * min_samples:
             continue
-
-        ann_exp = TRADING_DAYS / float(period) if annualize else None
 
         for alpha_pct in alphas_grid:
             alpha_val = float(alpha_pct) / 100.0
-
             q_mask = mw_f > alpha_val
 
-            pos_alpha = ae_f[q_mask]
-            neg_alpha = ae_f[~q_mask]
-
-            n_pos = len(pos_alpha)
-            n_neg = len(neg_alpha)
-
+            pos_raw = ae_f[q_mask]
+            neg_raw = ae_f[~q_mask]
+            n_pos, n_neg = len(pos_raw), len(neg_raw)
             if n_pos < min_samples or n_neg < min_samples:
                 continue
 
-            avg_pos_raw = float(np.mean(pos_alpha))
-            avg_neg_raw = float(np.mean(neg_alpha))
+            pos_w = _winsorize(pos_raw)
+            neg_w = _winsorize(neg_raw)
+
+            pos_net = pos_w - total_cost
+            neg_net = neg_w - total_cost
+
+            avg_pos_raw_val = _geo_mean_return(pos_net)
+            avg_neg_raw_val = _geo_mean_return(neg_net)
 
             if annualize:
-                avg_pos = (1.0 + max(-0.9999, min(avg_pos_raw, 100.0))) ** ann_exp - 1.0
-                avg_neg = (1.0 + max(-0.9999, min(avg_neg_raw, 100.0))) ** ann_exp - 1.0
+                avg_pos = _safe_annualize(avg_pos_raw_val, period)
+                avg_neg = _safe_annualize(avg_neg_raw_val, period)
             else:
-                avg_pos = avg_pos_raw
-                avg_neg = avg_neg_raw
+                avg_pos = avg_pos_raw_val
+                avg_neg = avg_neg_raw_val
 
             n_total = n_pos + n_neg
-            w_pos = n_pos / n_total
-            w_neg = n_neg / n_total
+            w_pos   = n_pos / n_total
+            w_neg   = n_neg / n_total
+            score   = w_pos * avg_pos - w_neg * avg_neg
 
-            score = w_pos * avg_pos - w_neg * avg_neg
+            ls_returns = np.concatenate([pos_net, -neg_net])
+            sharpe_val = _sharpe(ls_returns, period, annualize, rf_annual)
+
+            win_rate_pos = float(np.mean(pos_raw > 0)) * 100.0
+            win_rate_neg = float(np.mean(neg_raw > 0)) * 100.0
+
+            score_net = score * (1.0 - tax_rate) if score > 0 else score
 
             results.append({
                 "alpha_pct":               round(float(alpha_pct), 2),
                 "period_dias":             int(period),
-                "score":                   round(score, 8),
+                "score":                   round(score_net, 6),
                 "tir_pos_pct":             round(avg_pos * 100.0, 4),
                 "tir_neg_pct":             round(avg_neg * 100.0, 4),
-                "tir_cartera_pct":         round((w_pos * avg_pos - w_neg * avg_neg) * 100.0, 4),
-                "tir_pos_crudo_pct":       round(avg_pos_raw * 100.0, 4),
-                "tir_neg_crudo_pct":       round(avg_neg_raw * 100.0, 4),
+                "tir_cartera_pct":         round(score_net * 100.0, 4),
+                "tir_cartera_bruta_pct":   round(score * 100.0, 4),
+                "tir_pos_crudo_pct":       round(float(np.mean(pos_raw)) * 100.0, 4),
+                "tir_neg_crudo_pct":       round(float(np.mean(neg_raw)) * 100.0, 4),
+                "sharpe":                  round(sharpe_val, 4),
+                "win_rate_pos_pct":        round(win_rate_pos, 2),
+                "win_rate_neg_pct":        round(win_rate_neg, 2),
+                "cost_rt_pct":             round(total_cost * 100.0, 4),
                 "n_pos":                   n_pos,
                 "n_neg":                   n_neg,
                 "pct_seniales_positivas":  round(100.0 * w_pos, 2),
@@ -867,38 +945,216 @@ async def optimize_alpha_period(
             })
 
     if not results:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "No se encontraron combinaciones con muestras suficientes. "
-                "Prueba a reducir min_samples, ampliar los rangos de alpha/periodo "
-                "o verificar que el archivo granular contiene datos."
-            )
-        )
+        raise HTTPException(404,
+            "Sin combinaciones con muestras suficientes. "
+            "Prueba a reducir min_samples o ampliar rangos.")
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    best = results[0]
-
-    elapsed = round(time.time() - t0, 3)
 
     return {
-        "año":                 year,
-        "mejor_combinacion":   best,
-        "top":                 results[:top_n],
+        "año":               year,
+        "mejor_combinacion": results[0],
+        "top":               results[:top_n],
         "stats": {
             "combinaciones_evaluadas": len(results),
             "n_seniales_totales":      n_signals,
-            "tiempo_ejecucion_s":      elapsed,
+            "tiempo_ejecucion_s":      round(time.time() - t0, 3),
             "annualize":               annualize,
+            "cost_bps":                cost_bps,
+            "tax_rate_pct":       round(tax_rate * 100.0, 1),
+            "slippage_bps":            slippage_bps,
+            "rf_annual_pct":           round(rf_annual * 100.0, 2),
         },
         "parametros_busqueda": {
-            "alpha_min_pct":   round(float(alpha_min), 2),
-            "alpha_max_pct":   round(float(alpha_max), 2),
-            "alpha_step_pct":  round(float(alpha_step), 2),
-            "period_min":      int(period_min),
-            "period_max":      int(period_max),
-            "period_step":     int(period_step),
-            "min_samples":     min_samples,
+            "alpha_min_pct":  round(float(alpha_min), 2),
+            "alpha_max_pct":  round(float(alpha_max), 2),
+            "alpha_step_pct": round(float(alpha_step), 2),
+            "period_min":     int(period_min),
+            "period_max":     int(period_max),
+            "period_step":    int(period_step),
+            "min_samples":    min_samples,
+        },
+    }
+
+@app.get("/optimize/multi", tags=["Optimizar"],
+         summary="Optimizar en rango de años (consistencia histórica)",
+         description=(
+             "Ejecuta el grid search de `/optimize` en cada año de [year_from, year_to] "
+             "con los mismos parámetros. Devuelve:\n\n"
+             "- Mejor combinación por año\n"
+             "- Ranking agregado por frecuencia de aparición en el top-N\n"
+             "- Métricas de consistencia (% años en positivo, Sharpe medio, etc.)"
+         ))
+async def optimize_alpha_period_multi(
+    year_from:   int   = Query(..., ge=2000, le=2025),
+    year_to:     int   = Query(..., ge=2000, le=2025),
+    min_samples: int   = Query(default=30,   ge=5,   le=10_000),
+    alpha_min:   float = Query(default=0.5,  ge=0.1, le=99.0),
+    alpha_max:   float = Query(default=25.0, ge=0.5, le=200.0),
+    alpha_step:  float = Query(default=0.5,  ge=0.1, le=10.0),
+    period_min:  int   = Query(default=10,   ge=1,   le=252),
+    period_max:  int   = Query(default=252,  ge=1,   le=252),
+    period_step: int   = Query(default=5,    ge=1,   le=50),
+    top_n:       int   = Query(default=5,    ge=1,   le=20,
+                                description="Top-N por año para el ranking agregado"),
+    annualize:   bool  = Query(default=True),
+    cost_bps:    float = Query(default=7.5,  ge=0.0, le=50.0),
+    tax_rate: float = Query(
+        default=0.01, ge=0.0, le=0.35,
+        description="Tipo impositivo sobre beneficios (vehículo regulado = 1 % = 0.01)"
+    ),
+    slippage_bps: float = Query(
+        default=5.0, ge=0.0, le=50.0,
+        description="Slippage estimado por operación en bps (round-trip)."
+    ),
+    rf_annual: float = Query(
+        default=0.0, ge=0.0, le=0.20,
+        description="Tasa libre de riesgo anual para el Sharpe (e.g. 0.045 = 4,5 %)"
+    ),
+    token:       str   = Depends(verificar_api_key),
+):
+    if year_from > year_to:
+        raise HTTPException(422, "year_from debe ser <= year_to")
+
+    t0           = time.time()
+    por_año      = {}
+    from collections import defaultdict
+    freq: dict[tuple, list] = defaultdict(list)
+
+    n_alphas    = max(1, round((alpha_max - alpha_min) / alpha_step) + 1)
+    alphas_grid = np.linspace(alpha_min, alpha_min + alpha_step * (n_alphas - 1), n_alphas)
+    periods_lst = list(range(period_min, period_max + 1, period_step))
+    if not periods_lst or periods_lst[-1] != period_max:
+        periods_lst.append(period_max)
+    periods_grid = np.array(periods_lst, dtype=np.int32)
+
+    total_combos = len(alphas_grid) * len(periods_grid)
+    if total_combos > 100_000:
+        raise HTTPException(422, f"Grid demasiado grande ({total_combos:,}). Máx 100 000.")
+
+    cost_rt     = 2.0 * float(cost_bps)     / 10_000.0
+    slippage_rt = 2.0 * float(slippage_bps) / 10_000.0
+    total_cost  = cost_rt + slippage_rt
+
+    for year in range(year_from, year_to + 1):
+        try:
+            df = _load_granular(year, REND_DIR)
+        except HTTPException:
+            por_año[year] = {"error": f"Sin datos para {year}"}
+            continue
+
+        mat, cum_max, n_sig = _build_matrix(df)
+        del df
+
+        year_results = []
+
+        for period in periods_grid:
+            Y = int(period) - 1
+            if Y <= 0 or Y >= 252:
+                continue
+
+            max_window  = cum_max[:, Y - 1]
+            alpha_end   = mat[:, Y]
+            finite_mask = np.isfinite(alpha_end)
+            mw_f = max_window[finite_mask].astype(np.float64)
+            ae_f = alpha_end[finite_mask].astype(np.float64)
+            if len(ae_f) < 2 * min_samples:
+                continue
+
+            for alpha_pct in alphas_grid:
+                alpha_val = float(alpha_pct) / 100.0
+                q_mask    = mw_f > alpha_val
+                pos_raw   = ae_f[q_mask]
+                neg_raw   = ae_f[~q_mask]
+                if len(pos_raw) < min_samples or len(neg_raw) < min_samples:
+                    continue
+
+                pos_w = _winsorize(pos_raw) - total_cost
+                neg_w = _winsorize(neg_raw) - total_cost
+
+                avg_p = _geo_mean_return(pos_w)
+                avg_n = _geo_mean_return(neg_w)
+
+                if annualize:
+                    avg_p = _safe_annualize(avg_p, period)
+                    avg_n = _safe_annualize(avg_n, period)
+
+                n_t   = len(pos_raw) + len(neg_raw)
+                w_pos = len(pos_raw) / n_t
+                w_neg = len(neg_raw) / n_t
+                score = w_pos * avg_p - w_neg * avg_n
+
+                score_net = score * (1.0 - tax_rate) if score > 0 else score
+
+                ls     = np.concatenate([pos_w, -neg_w])
+                sharpe = _sharpe(ls, period, annualize, rf_annual)
+
+                year_results.append({
+                    "alpha_pct":             round(float(alpha_pct), 2),
+                    "period_dias":           int(period),
+                    "score":                 round(score_net, 6),
+                    "tir_cartera_pct":       round(score_net * 100.0, 4),
+                    "tir_cartera_bruta_pct": round(score * 100.0, 4),
+                    "sharpe":                round(sharpe, 4),
+                    "n_pos":                 len(pos_raw),
+                    "n_neg":                 len(neg_raw),
+                })
+
+        if not year_results:
+            por_año[year] = {"error": "Sin combinaciones válidas"}
+            continue
+
+        year_results.sort(key=lambda x: x["score"], reverse=True)
+        best      = year_results[0]
+        top_local = year_results[:top_n]
+
+        for r in top_local:
+            key = (r["alpha_pct"], r["period_dias"])
+            freq[key].append({
+                "year":  year,
+                "score": r["score"],
+                "sharpe": r["sharpe"],
+            })
+
+        por_año[year] = {
+            "mejor":           best,
+            "top":             top_local,
+            "n_seniales":      n_sig,
+            "combinaciones":   len(year_results),
+        }
+
+    ranking_agg = []
+    años_total  = year_to - year_from + 1
+    for (a_pct, p_dias), entries in freq.items():
+        scores_list  = [e["score"]  for e in entries]
+        sharpe_list  = [e["sharpe"] for e in entries]
+        años_pos     = sum(1 for s in scores_list if s > 0)
+        ranking_agg.append({
+            "alpha_pct":            a_pct,
+            "period_dias":          p_dias,
+            "n_años_en_top":        len(entries),
+            "pct_años_en_top":      round(100.0 * len(entries) / años_total, 1),
+            "pct_años_positivo":    round(100.0 * años_pos / len(entries), 1),
+            "score_medio":          round(float(np.mean(scores_list)), 6),
+            "score_mediana":        round(float(np.median(scores_list)), 6),
+            "score_std":            round(float(np.std(scores_list)), 6),
+            "sharpe_medio":         round(float(np.mean(sharpe_list)), 4),
+        })
+
+    ranking_agg.sort(key=lambda x: (x["n_años_en_top"], x["score_medio"]), reverse=True)
+
+    return {
+        "rango_años":        f"{year_from}-{year_to}",
+        "años_con_datos":    sum(1 for v in por_año.values() if "error" not in v),
+        "resultados_por_año": por_año,
+        "ranking_agregado":  ranking_agg[:20],
+        "stats": {
+            "tiempo_ejecucion_s": round(time.time() - t0, 3),
+            "annualize":          annualize,
+            "cost_bps":           cost_bps,
+            "tax_rate_pct":       round(tax_rate * 100.0, 1),
+            "slippage_bps":            slippage_bps,
+            "rf_annual_pct":           round(rf_annual * 100.0, 2),
         },
     }
 

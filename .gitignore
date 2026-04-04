@@ -9,3 +9,4 @@ db/*.parquet
 db/historico_completo.csv
 tools/*.md
 analisis.md
+strategy.md
